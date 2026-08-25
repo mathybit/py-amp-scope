@@ -430,7 +430,7 @@ def main():
     print("Testing devices (type 'q' when done):")
     interactive_test(output_indices, input_indices)
 
-    # Prompt device selection
+    """# Prompt device selection
     print()
     send_idx = None
     recv_idx = None
@@ -476,7 +476,7 @@ def main():
         print("Both send and receive devices must be selected.")
         return
 
-    #save_config(send_idx, recv_idx)
+    #save_config(send_idx, recv_idx)"""
 
 
 if __name__ == "__main__":
