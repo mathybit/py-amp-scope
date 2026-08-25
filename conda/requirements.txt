@@ -1,0 +1,38 @@
+# pip dependencies for audio
+# Install after creating the conda environment: pip install -r conda/requirements.txt
+#
+# PyTorch is NOT listed here -- install it separately (see conda/README.md).
+
+# Audio processing
+librosa=0.10
+noisereduce
+pedalboard
+pydub
+pywavelets
+sounddevice
+
+# Data science / ML
+numpy>=2.0
+openpyxl
+pandas>=2.2
+scikit-learn>=1.5
+matplotlib>=3.8
+tqdm>=4.66
+#flask>=3.1
+#pydantic>=2.13
+
+# Image handling
+#pillow>=10.2
+
+pygame==2.6.1
+
+# Configuration parsing
+pyyaml>=6.0
+
+# Jupyter notebook kernel
+ipykernel>=7.0
+iprogress
+
+# Testing
+pytest>=7.4
+pytest-cov>=4.1

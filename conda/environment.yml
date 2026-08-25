@@ -1,0 +1,28 @@
+# Conda environment for audio processing
+#
+# One-time global config (run once per machine before creating the environment):
+#   conda config --add channels conda-forge
+#   conda config --set channel_priority strict
+#
+# Create:  conda env create -f conda/environment.yml
+# Update:  conda env update -f conda/environment.yml --prune
+# Activate: conda activate audio
+
+name: audio
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.12
+  - pip
+  - setuptools
+
+
+
+# After creating the environment, install pip dependencies:
+#   pip install -r conda/requirements.txt
+#
+# You can install PyTorch (and torchaudio) separately after activating the environment.
+# See README.md for the install command.
