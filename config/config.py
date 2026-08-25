@@ -9,13 +9,13 @@ recv_ch = "LEFT"
 
 # Gains as percentage (0-100)
 send_gain = 100
-recv_gain = 80
+recv_gain = 100
 
 # Calibration signal method and frequency range
 cal_method = "multitone"   # "sweep" | "multitone" | "pink" | "white"
-freq_min = 20
-freq_max = 24000       # Nyquist = 24000 at fs=48kHz
-fs = 48000             # default sample rate
+freq_min = 50
+freq_max = 20000       # adjusted for USB interface spec
+fs = 44100             # default sample rate (USB interface lowest common)
 
 # Receive path (direct vs isolated)
 recv_path = "dir"      # "dir" | "iso"

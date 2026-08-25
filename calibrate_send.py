@@ -33,6 +33,8 @@ from utils.audio.sweep_utils import (  # noqa: E402
     build_chart_png,
     _DEFAULT_DURATION,
     _FS_DEFAULT,
+    _FREQ_MIN_DEFAULT,
+    _FREQ_MAX_DEFAULT,
 )
 
 
@@ -74,11 +76,17 @@ def parse_args(argv=None):
     parser.add_argument("--recv-gain", type=float, default=None, help="Receive gain %")
 
     # Sample rate
-    parser.add_argument("--fs", type=int, default=None, help="Sample rate Hz (default: 48000)")
+    parser.add_argument("--fs", type=int, default=None, help="Sample rate Hz (default: from config)")
 
     # Output
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory for profile files (default: data/)")
+
+    # Multitone parameters
+    parser.add_argument("--num-freqs", type=int, default=None,
+                        help="Number of multitone frequency bins (default: auto from duration)")
+    parser.add_argument("--linear-freqs", action="store_true",
+                        help="Use linear (uniform) frequency spacing instead of log-spacing")
 
     # Actions
     parser.add_argument("--dry-run", action="store_true",
@@ -102,8 +110,8 @@ def main():
     method = merged["cal_method"]
     duration = float(merged.get("duration") or args.duration or _DEFAULT_DURATION)
     fs = int(merged.get("fs") or args.fs or _FS_DEFAULT)
-    freq_min = int(merged.get("freq_min") or args.freq_min or 20)
-    freq_max = int(merged.get("freq_max") or args.freq_max or 24000)
+    freq_min = int(merged.get("freq_min") or args.freq_min or _FREQ_MIN_DEFAULT)
+    freq_max = int(merged.get("freq_max") or args.freq_max or _FREQ_MAX_DEFAULT)
     send_device = merged.get("send_device")
     recv_device = merged.get("recv_device")
     send_gain = float(merged.get("send_gain") or args.send_gain or 30)
@@ -112,6 +120,10 @@ def main():
 
     if args.output_dir:
         output_dir = Path(args.output_dir)
+
+    # Multitone parameters
+    n_freqs = args.num_freqs
+    log_spaced = not args.linear_freqs
 
     print("=" * 60)
     print(f"PyAmpScope Send Calibration Profile")
@@ -128,13 +140,18 @@ def main():
     print("=" * 60)
 
     # Step 1: Generate signal
-    print("\n[Step 1/6] Generating calibration signal...")
+    spacing = "log" if log_spaced else "linear"
+    duration_str = f"{duration:.0f}s"
+    print(f"\n[Step 1/6] Generating calibration signal ({method}, {spacing}-spaced)...")
     signal_result = generate_cal_signal(
         method=method, duration=duration, fs=fs,
         freq_min=freq_min, freq_max=freq_max,
+        n_frequencies=n_freqs, log_spaced=log_spaced,
     )
     if method == "multitone":
         generated, frame_freqs = signal_result
+        print(f"  Frequency bins : {len(frame_freqs)} (auto) [{spacing}-spaced]")
+        print(f"  Bin range      : {frame_freqs[0]:.1f}-{frame_freqs[-1]:.1f} Hz")
     else:
         generated = signal_result
 

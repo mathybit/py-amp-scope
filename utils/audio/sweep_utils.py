@@ -32,9 +32,9 @@ from scipy.io import wavfile
 # Constants
 # ---------------------------------------------------------------------------
 _DEFAULT_DURATION = 30   # seconds
-_FS_DEFAULT = 48000
+_FS_DEFAULT = 44100
 _FREQ_MIN_DEFAULT = 20
-_FREQ_MAX_DEFAULT = 24000
+_FREQ_MAX_DEFAULT = 20000
 _REG_TOL = 1e-3           # regularization floor for inverse filter
 
 # NPZ keys
@@ -63,27 +63,53 @@ def generate_multitone(
     fs: int = _FS_DEFAULT,
     freq_min: int = _FREQ_MIN_DEFAULT,
     freq_max: int = _FREQ_MAX_DEFAULT,
+    n_frequencies: Optional[int] = None,
+    log_spaced: bool = True,
 ) -> np.ndarray:
     """Generate equal-energy multi-tone signal.
 
-    Divides `duration` into N frames. Each frame is a pure sine at one
-    discrete frequency completing an integer number of cycles. Frequencies are
-    evenly spaced across [freq_min, freq_max] with ~60 Hz spacing (giving
-    fine resolution while keeping per-bin energy high).
+    Divides ``duration`` into frames of 0.5 s each. Each frame carries one pure
+    sine at a single discrete frequency completing an integer number of cycles,
+    guaranteeing zero spectral leakage and equal energy per bin by construction.
 
-    Returns:
-        numpy.ndarray[float32]: mono signal samples.
+    Parameters
+    ----------
+    n_frequencies : int or None
+        Total number of tone bins.  When ``None``, auto-calculated from
+        ``duration // 0.5`` (one frame every half-second).
+    log_spaced : bool
+        If True, frequencies are distributed logarithmically (dense at low
+        end, sparse at high end).  Useful for guitar-amp analysis where most
+        harmonic energy lives below 1 kHz.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        ``(signal, freq_array)`` where ``freq_array`` holds per-frame center
+        frequencies in Hz.
     """
-    n_frames = max(int(duration // 0.5), 1)      # at least one frame per 0.5 s
+    n_frames = max(int(duration // 0.5), 1) if n_frequencies is None else n_frequencies
     frame_samples = int(fs * 0.5)                  # each frame is 500 ms
+
+    if log_spaced:
+        freqs = np.logspace(
+            np.log10(freq_min), np.log10(freq_max),
+            n_frames, endpoint=True,
+        )
+    else:
+        freqs = np.linspace(freq_min, freq_max, n_frames)
+
+    # Cap by Nyquist — clamp any frequency above fs/2 to avoid aliasing
+    nyquist = fs / 2.0
+    freqs = np.minimum(freqs, nyquist - 1.0)
+
     total_samples = n_frames * frame_samples
     signal = np.zeros(total_samples, dtype=np.float64)
 
-    freqs = np.linspace(freq_min, freq_max, n_frames)
-    for i, (f_center, frame_start) in enumerate(zip(freqs, range(0, total_samples, frame_samples))):
-        f_i = freq_min + (freq_max - freq_min) * i / max(n_frames - 1, 1)
+    for i, frame_start in enumerate(range(0, total_samples, frame_samples)):
+        f_i = freqs[i]
         t_frame = np.arange(frame_samples) / fs
-        # Integer cycles: round to nearest to minimize leakage
+        # Integer cycles: round to nearest to minimise leakage
         n_cycles = int(round(f_i * frame_samples / fs))
         if n_cycles < 1:
             n_cycles = 1
@@ -94,8 +120,8 @@ def generate_multitone(
     # Normalize to float32 range without clipping
     peak = np.max(np.abs(signal))
     if peak > 0:
-        signal *= 1.0 / peak                        # scale to [-1, +1]
-    return signal.astype(np.float32), freqs[:n_frames]
+        signal *= 1.0 / peak
+    return signal.astype(np.float32), freqs
 
 
 def generate_sweep(
@@ -171,6 +197,8 @@ def generate_cal_signal(
     fs: int = _FS_DEFAULT,
     freq_min: int = _FREQ_MIN_DEFAULT,
     freq_max: int = _FREQ_MAX_DEFAULT,
+    n_frequencies: Optional[int] = None,
+    log_spaced: bool = True,
 ):
     """Dispatch to signal generator by method name.
 
@@ -180,7 +208,8 @@ def generate_cal_signal(
     """
     if method == "multitone":
         return generate_multitone(duration=duration, fs=fs,
-                                  freq_min=freq_min, freq_max=freq_max)
+                                  freq_min=freq_min, freq_max=freq_max,
+                                  n_frequencies=n_frequencies, log_spaced=log_spaced)
     elif method == "sweep":
         return generate_sweep(duration=duration, fs=fs,
                               freq_min=freq_min, freq_max=freq_max)
@@ -363,7 +392,7 @@ def save_cal_profile(
 
 
 # ---------------------------------------------------------------------------
-# Play and capture via sounddevice callback streaming
+# Play and capture via sounddevice play/rec API
 # ---------------------------------------------------------------------------
 def play_and_capture(
     generated_signal: np.ndarray,
@@ -376,12 +405,12 @@ def play_and_capture(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Play ``generated_signal`` on the send device while capturing from the recv device.
 
-    Uses simultaneous OutputStream + InputStream callback streaming. Callbacks stop
-    automatically when signal samples are exhausted. Returns (captured, generated_trimmed)
-    where both arrays have been scaled by their respective gain percentages.
+    Uses ``sd.play()`` + ``sd.rec()`` with ``sd.wait()`` for reliable long-duration
+    capture (avoids callback frame drops that cause "choppy" audio on cheap USB interfaces).
+    Returns (captured, generated_trimmed) where both arrays have been scaled by their
+    respective gain percentages.
     """
     send_scaled = np.clip(generated_signal * (send_gain / 100.0), -1.0, 1.0).astype(np.float32)
-    expected_samples = int(duration * fs)
 
     # Validate devices support required I/O
     all_devs = sd.query_devices()
@@ -393,74 +422,30 @@ def play_and_capture(
     if recv_device is not None and dev_channel_count(all_devs[recv_device], "in") == 0:
         raise ValueError(f"Device {recv_device} does not support capture.")
 
-    # Buffers
-    buf = np.zeros(expected_samples, dtype='float32')
-    outbuf = np.zeros(512, dtype='float32').reshape(-1, 1)
-    offset = 0
-    output_done = False
+    print(f"  [Playing on device {send_device} / capturing on device {recv_device}]")
+    print(f"  Signal: len={len(send_scaled)} peak={np.max(np.abs(send_scaled)):.4f} RMS={np.sqrt(np.mean(send_scaled**2)):.4f} dtype={send_scaled.dtype}")
 
-    def _out_cb(outdata, frame_count, time_flag, status):
-        nonlocal offset, output_done
-        if status:
-            print(f"  [Output stream status: {status}]")
-        start = offset
-        end = min(offset + frame_count, len(send_scaled))
-        n_out = min(end - start, len(outbuf))
-        outbuf[:n_out] = send_scaled[start:end].reshape(-1, 1)
-        if end < len(send_scaled):
-            # More signal remaining
-            outbuf[n_out:] = 0.0
-            offset = end
-            return (outbuf, "continue")
-        else:
-            # Signal exhausted — zero-fill rest and stop stream
-            outbuf[n_out:] = 0.0
-            output_done = True
-            return outbuf[:n_out]
-
-    def _in_cb(indata, frame_count, time_flag, status):
-        nonlocal offset
-        if status:
-            print(f"  [Input stream status: {status}]")
-        n = min(frame_count, expected_samples - offset)
-        buf[offset:offset + n] = indata.flatten()[:n]
-        offset += n
-
+    # Start playback (blocking -- will block until complete)
     try:
-        print(f"  [Playing on device {send_device} / capturing on device {recv_device}]")
-        out_stream = sd.OutputStream(
-            device=send_device, samplerate=fs, channels=1,
-            callback=_out_cb, blocksize=512,
+        play_id = sd.play(send_scaled, samplerate=fs, device=send_device)
+        print(f"  [sd.play returned stream ID: {play_id}]")
+        captured = sd.rec(
+            int(duration * fs),
+            samplerate=fs,
+            channels=1,
+            device=recv_device,
+            dtype='float32',
         )
-        in_stream = sd.InputStream(
-            device=recv_device, samplerate=fs, channels=1,
-            callback=_in_cb, blocksize=512,
-        )
-
-        out_stream.start()
-        in_stream.start()
-
-        # Wait for both buffers to fill up
-        elapsed = 0
-        wait_limit = int(duration * 1.5) + 2      # generous margin
-        while (offset < expected_samples or not output_done) and elapsed < wait_limit:
-            sd.sleep(100)                            # non-blocking sleep
-            elapsed += 0.1
-
-        out_stream.stop()
-        in_stream.stop()
-        out_stream.close()
-        in_stream.close()
-
+        print(f"  [Capturing {len(captured)} samples @ {fs} Hz ...]")
+        sd.wait()                              # blocks until playback+capture done
     except Exception as e:
         raise RuntimeError(f"Audio I/O failed: {e}") from e
 
-    # Truncate to actual played duration for consistent FFT lengths
-    actual_samples = min(offset, expected_samples)
+    actual_samples = len(captured)
     if actual_samples == 0:
         raise RuntimeError("No audio captured — check device selection and gains.")
 
-    return buf[:actual_samples].copy(), send_scaled[:actual_samples].copy()
+    return captured.flatten()[:actual_samples].copy(), send_scaled[:actual_samples].copy()
 
 
 # ---------------------------------------------------------------------------

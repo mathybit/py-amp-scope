@@ -14,13 +14,18 @@ _DEFAULTS = {
     "cal_method": "multitone",
     "duration": 30,
     "freq_min": 20,
-    "freq_max": 24000,
-    "fs": 48000,
+    "freq_max": 20000,
+    "fs": 44100,
     "recv_path": "dir",
     "data_dir": "data",
     "logs_dir": "logs",
     "cal_send_file": "di_send_profile.npz",
     "cal_recv_file": "di_receive_profile.npz",
+    # list_audio_devices.py defaults (override in config.py as needed)
+    "tone_freq": 440,
+    "tone_duration": 2.0,
+    "record_seconds": 3.0,
+    "test_tone_vol": 0.3,
 }
 
 

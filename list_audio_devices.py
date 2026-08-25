@@ -18,24 +18,36 @@ from pathlib import Path
 import numpy as np
 import sounddevice as sd
 
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-TONE_FREQ = 440       # Hz - standard A4 tuning note
-TONE_DURATION = 2.0   # seconds
-RECORD_SECONDS = 3    # seconds
-TEST_TONE_VOL = 0.3   # cap at 30% for safety
-
 # Resolve repo root (one level up from this script's directory)
 REPO_ROOT = Path(__file__).resolve().parent
+
+# Load config values — all constants flow through here
+config_path = REPO_ROOT / "config" / "config.py"
+_config_defaults = {}
+try:
+    for line in config_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            key, val = line.split("=", 1)
+            _config_defaults[key.strip()] = eval(val.strip())
+except FileNotFoundError:
+    pass
+
+TONE_FREQ = _config_defaults.get("tone_freq", 440)
+TONE_DURATION = _config_defaults.get("tone_duration", 2.0)
+RECORD_SECONDS = _config_defaults.get("record_seconds", 3.0)
+TEST_TONE_VOL = _config_defaults.get("test_tone_vol", 0.3)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def generate_tone(freq=TONE_FREQ, duration=TONE_DURATION, fs=48000, vol=TEST_TONE_VOL):
+def generate_tone(freq=TONE_FREQ, duration=TONE_DURATION, fs=None, vol=TEST_TONE_VOL):
     """Generate a sine wave test tone."""
+    if fs is None:
+        fs = _config_defaults.get("fs", 44100)
     t = np.arange(int(fs * duration)) / fs
     return (np.sin(2 * np.pi * freq * t) * vol).astype(np.float32)
 
@@ -164,8 +176,9 @@ def play_tone(device_idx):
         return False
 
     tone = generate_tone()
+    sr = _config_defaults.get("fs", 44100)
     try:
-        sd.play(tone, samplerate=48000, device=device_idx)
+        sd.play(tone, samplerate=sr, device=device_idx)
         sd.wait()  # block until playback completes
         print(f"  [Played 440Hz tone through device {device_idx}]")
         return True
@@ -184,10 +197,10 @@ def record_from_device(device_idx):
         print(f"Device {device_idx} does not support capture.", file=sys.stderr)
         return False
 
-    # Use the device's default sample rate if available
-    sr = dev.get("default_samplerate", 48000)
-    if not isinstance(sr, (int, float)) or sr <= 0:
-        sr = 48000
+    # Use the device's default sample rate if available, fall back to config fs
+    sr = dev.get("default_samplerate", None)
+    if sr is None or sr <= 0:
+        sr = _config_defaults.get("fs", 44100)
     frames = int(sr * RECORD_SECONDS)
 
     buf = np.empty(frames, dtype='float32')
