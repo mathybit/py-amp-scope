@@ -15,6 +15,8 @@ _DEFAULTS = {
     "duration": 30,
     "freq_min": 20,
     "freq_max": 20000,
+    "min_calibration_time": 60,
+    "num_freqs_default": 160,
     "fs": 44100,
     "recv_path": "dir",
     "data_dir": "data",

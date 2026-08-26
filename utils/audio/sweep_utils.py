@@ -427,7 +427,26 @@ def play_and_capture(
 
     # Start playback (blocking -- will block until complete)
     try:
-        play_id = sd.play(send_scaled, samplerate=fs, device=send_device)
+        # Force mono output for cheap USB adapters that advertise multi-channel
+        # but only handle channel 1.
+        ch_out = dev_channel_count(all_devs[send_device], "out")
+        print(f"  [Device {send_device}: out_ch={ch_out}, max_output_channels={all_devs[send_device].get('max_output_channels', 'N/A')}]")
+        if ch_out > 1:
+            out_data = send_scaled.reshape(-1, 1)      # shape (N, 1) mono
+            print(f"  [Reshaped signal to mono ({len(out_data)} samples)]")
+        else:
+            out_data = send_scaled
+
+        # Warm-up playback for cheap USB adapters. These often need a short
+        # initial stream to establish the PortAudio connection before accepting
+        # long-duration streams (which would silently fail on first call).
+        warmup = np.clip(np.sin(2 * np.pi * 440 * np.arange(int(fs * 0.3)) / fs) * 0.5, -1.0, 1.0).astype(np.float32)
+        warmup_mono = warmup.reshape(-1, 1) if ch_out > 1 else warmup
+        sd.play(warmup_mono, samplerate=fs, device=send_device)
+        sd.wait()
+        print(f"  [Warm-up tone complete, starting main signal...]")
+
+        play_id = sd.play(out_data, samplerate=fs, device=send_device)
         print(f"  [sd.play returned stream ID: {play_id}]")
         captured = sd.rec(
             int(duration * fs),
