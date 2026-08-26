@@ -5,4 +5,6 @@ logs/
 
 
 # To be removed from gitignore later
-data/
+*.wav
+*.meta.json
+
