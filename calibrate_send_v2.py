@@ -282,9 +282,7 @@ def parse_args(argv=None):
         help="Capture mode (default: single-capture)",
     )
     parser.add_argument("--method", choices=["sweep", "multitone", "pink", "white"],
-                        default=None, help=f"Calibration signal type (default: {cfg.cal_method})")
-    parser.add_argument("--duration", type=float, default=None,
-                        help=f"Tone duration in seconds (sequential mode only; default: {cfg.tone_duration})")
+                        default=None, help="Calibration signal type (from config by default)")
     parser.add_argument("--freq-min", type=int, default=None, help=f"Lowest analysis frequency Hz (config: {cfg.freq_min})")
     parser.add_argument("--freq-max", type=int, default=None, help=f"Highest analysis frequency Hz (config: {cfg.freq_max})")
 
@@ -346,6 +344,33 @@ def main():
     if args.output_dir:
         output_dir = Path(args.output_dir)
 
+    # CLI overrides for config values
+    if args.method is not None:
+        method = args.method
+    if args.freq_min is not None:
+        freq_min = args.freq_min
+    if args.freq_max is not None:
+        freq_max = args.freq_max
+    if args.send_device is not None:
+        send_device = args.send_device
+    if args.recv_device is not None:
+        recv_device = args.recv_device
+    if args.fs is not None:
+        fs = args.fs
+    if args.num_freqs is not None:
+        # num_freqs overrides the auto-computed floor; use max(time-constrained, CLI-specified)
+        num_freqs_arg = int(args.num_freqs)
+        min_time = float(cfg.min_calibration_time)
+        config_default_bins = int(cfg.num_freqs_default)
+    else:
+        num_freqs_arg = None
+        min_time = 0.0
+        config_default_bins = int(cfg.num_freqs_default)
+
+    # Channel overrides (not-implemented for actual stream routing; stored for metadata)
+    send_ch = args.send_ch if args.send_ch is not None else cfg.send_ch
+    recv_ch = args.recv_ch if args.recv_ch is not None else cfg.recv_ch
+
     # Tone duration / gap — from config, overridable via CLI
     tone_duration = float(cfg.tone_duration)
     gap_s = float(cfg.tone_gap)
@@ -355,10 +380,11 @@ def main():
         gap_s = float(args.gap)
 
     # Frequency bin count: max(time-constrained floor, config default)
-    min_time = float(cfg.min_calibration_time)
-    config_default_bins = int(cfg.num_freqs_default)
     auto_bins = math.ceil(min_time / (tone_duration + gap_s))
-    num_freqs = max(auto_bins, config_default_bins)
+    if num_freqs_arg is not None:
+        num_freqs = max(auto_bins, num_freqs_arg)
+    else:
+        num_freqs = max(auto_bins, config_default_bins)
 
     # Total signal duration for metadata (needed before dry-run check)
     total_s = num_freqs * (tone_duration + gap_s)
@@ -378,6 +404,8 @@ def main():
     print(f"  Recv device: {recv_device}")
     print(f"  Send gain  : {send_gain}%")
     print(f"  Recv gain  : {recv_gain}%")
+    print(f"  Send ch    : {send_ch} (phase-2: not yet applied to streams)")
+    print(f"  Recv ch    : {recv_ch} (phase-2: not yet applied to streams)")
     print(f"  Output dir : {output_dir}")
     print("=" * 60)
 
@@ -400,6 +428,8 @@ def main():
             "recv_device": recv_device,
             "send_gain": send_gain,
             "recv_gain": recv_gain,
+            "send_ch": send_ch,
+            "recv_ch": recv_ch,
             "captured_available": False,
         }
         save_cal_profile(output_dir, "v2_cal_send", metadata, response_H=np.zeros(num_freqs), freqs=freq_array)
@@ -529,6 +559,8 @@ def main():
             "recv_device": recv_device,
             "send_gain": send_gain,
             "recv_gain": recv_gain,
+            "send_ch": send_ch,
+            "recv_ch": recv_ch,
             "captured_available": True,
             "chart_png_bytes": png_bytes,
         }
