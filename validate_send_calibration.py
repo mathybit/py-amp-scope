@@ -1,16 +1,15 @@
 #!/usr/bin/env python
 """Validate send-path calibration by measuring frequency deviation with/without correction.
 
-Loads the send calibration profile (v2_cal_send_profile.npz), sends a uniform tone at each
+Loads the send calibration profile (cal_send_profile.npz), sends a uniform tone at each
 bin frequency, and measures how far each returned amplitude deviates from the mean across all
 bins. Two modes:
 
   Default (no --correct): sends uncorrected signal; shows raw deviation of the calibration
                            profile (i.e. what we measured during the last run).
 
-  --correct: computes an inverse correction filter from the profile on-the-fly, sends a
-             pre-corrected signal (tone amplitude scaled by conj(H)/|H|), and measures how
-             much flatter the returned signal is.
+  --correct: loads per-bin correction factors from the saved NPZ file and applies them to the
+             sent tone amplitudes, then measures how much flatter the returned signal is.
 
 The script answers: is the send circuitry uniform enough that calibration matters?
 
@@ -49,7 +48,7 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--cal-file", type=str, default=None,
-        help="Path to v2_cal_send_profile.npz (default: data/v2_cal_send_profile.npz)",
+        help="Path to cal_send_profile.npz (default: data/cal_send_profile.npz)",
     )
     parser.add_argument(
         "--correct", action="store_true",
@@ -283,10 +282,10 @@ def _load_corrections(data_dir, logs_dir):
     """
     # Try standard paths for corrections NPZ (in priority order)
     correction_paths = [
-        data_dir / "v2_cal_send_corrections.npz",
-        logs_dir / "v2_cal_send_corrections.npz",
-        _REPO_ROOT / "data" / "v2_cal_send_corrections.npz",
-        _REPO_ROOT / "logs" / "v2_cal_send_corrections.npz",
+        data_dir / "cal_send_corrections.npz",
+        logs_dir / "cal_send_corrections.npz",
+        _REPO_ROOT / "data" / "cal_send_corrections.npz",
+        _REPO_ROOT / "logs" / "cal_send_corrections.npz",
     ]
     for path in correction_paths:
         if path.exists():
@@ -303,7 +302,7 @@ def main():
     if args.cal_file:
         cal_path = Path(args.cal_file)
     else:
-        cal_path = _REPO_ROOT / "data" / "v2_cal_send_profile.npz"
+        cal_path = _REPO_ROOT / "data" / "cal_send_profile.npz"
 
     if not cal_path.exists():
         print(f"ERROR: Calibration profile not found: {cal_path}")
