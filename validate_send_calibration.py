@@ -273,6 +273,29 @@ def _measure_all_single_capture(freqs, tone_duration, gap_s, fs, send_gain, amp_
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+# Corrected signal (no correction) or pre-corrected signal (with inverse correction).
+# With --correct, loads per-bin correction factors from the calibration profile if available.
+
+def _load_corrections(data_dir, logs_dir):
+    """Load pre-computed correction factors from the calibration output directory.
+
+    Returns a tuple of (correction_factors, loaded_from_file) or (None, False) if not found.
+    """
+    # Try standard paths for corrections NPZ (in priority order)
+    correction_paths = [
+        data_dir / "v2_cal_send_corrections.npz",
+        logs_dir / "v2_cal_send_corrections.npz",
+        _REPO_ROOT / "data" / "v2_cal_send_corrections.npz",
+        _REPO_ROOT / "logs" / "v2_cal_send_corrections.npz",
+    ]
+    for path in correction_paths:
+        if path.exists():
+            data = np.load(str(path))
+            factors = data["correction_factor"]
+            return factors, str(path)
+    return None, False
+
+
 def main():
     args = parse_args()
 
@@ -307,12 +330,31 @@ def main():
     print(f"  Tone duration     : {tone_duration}s")
     print(f"  Mode              : {args.mode}")
 
-    # Compute per-tone amplitude factors (inverse filter on-the-fly)
-    H_linear = 10 ** (H_db_raw / 20.0)  # dBFS -> linear magnitude
+    # Compute per-tone amplitude factors
+    # The correction factors from the profile are dimensionless multipliers (e.g. 1.2 means "boost by 20%").
+    # We multiply them by the base tone amplitude (tone_amplitude * send_gain/100) to get the actual DAC output.
+    # This ensures validate sends signals at the same absolute level as calibrate_send_v2.
+    base_tone = float(cfg.tone_amplitude) * float(cfg.send_gain) / 100.0  # e.g. 0.2 * 0.70 = 0.14
+
     if correction_applied:
-        amp_factors = np.where(H_linear > 1e-6, 1.0 / np.sqrt(H_linear), 1.0)
+        # Try loading pre-computed correction factors from profile first
+        corr_factors, path = _load_corrections(Path(cfg.data_dir), Path(cfg.logs_dir))
+        if corr_factors is not None and len(corr_factors) == n_bins:
+            print(f"  Loaded corrections from : {path}")
+            amp_factors = base_tone * np.array(corr_factors)
+        else:
+            # Fallback: compute on-the-fly from raw profile (H_mean / H_smoothed via pct_diff)
+            print("  Note: no pre-computed corrections found; computing on-the-fly from profile.")
+            H_linear = 10 ** (H_db_raw / 20.0)
+            H_mean_linear = float(np.mean(H_linear))
+            amp_factors = base_tone * np.where(
+                H_linear > 1e-6,
+                H_mean_linear / H_linear * np.ones(n_bins),
+                np.ones(n_bins),
+            )
     else:
-        amp_factors = np.ones(n_bins, dtype=np.float64)
+        # Baseline: send uniform tone at the same amplitude used in calibration
+        amp_factors = np.full(n_bins, base_tone, dtype=np.float64)
 
     # Measure via hardware
     print(f"\n[{args.mode} mode: sending {n_bins} tones...]\n", flush=True)
