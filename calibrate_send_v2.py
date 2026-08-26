@@ -36,9 +36,8 @@ _REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 from config import config as cfg  # noqa: E402
-from config import config as cfg  # noqa: E402
-from utils.audio.sweep_utils import compute_inverse_filter, save_cal_profile
-from utils.charting_utils import build_multichart_png  # noqa: E402
+from utils.audio.sweep_utils import save_cal_profile
+from utils.charting_utils import build_multichart_png, _smooth_moving_average  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -565,28 +564,21 @@ def main():
             "recv_ch": recv_ch,
         }
 
-        # Always compute and save inverse correction filter from magnitude response
-        if valid_results:
-            amp_linear = 10 ** (valid_amps / 20.0)
-        else:
-            amp_linear = 10 ** (amp_array / 20.0)
+        # Smoothing: centered moving average over nearest neighbors for correction factor
+        H_db_input = valid_amps if valid_results else amp_array
+        smoothed_db = _smooth_moving_average(H_db_input, window_size=cfg.smoothing_neighbors)
 
-        H_complex = amp_linear  # real part only, magnitude as complex with zero phase
-        W_complex, ir = compute_inverse_filter(
-            H=H_complex, freqs=freq_array, fft_len=int(tone_duration * fs),
-        )
+        # Correction factor in linear space: correction = mean_linear / smoothed_linear
+        mean_db_val = float(np.mean(H_db_input))
+        mean_linear = 10 ** (mean_db_val / 20.0)
+        smoothed_linear = 10 ** (smoothed_db / 20.0)
+        corr_factors = mean_linear / smoothed_linear
 
-        metadata["filter_length"] = len(ir)
-        metadata["filter_peak"] = float(np.max(np.abs(ir)))
-        metadata["response_H"] = valid_amps if valid_results else amp_array
-        metadata["freqs"] = valid_freqs if valid_results else freq_array
-
-        # Build multi-chart (3 panels: response, deviation dB, deviation sigma) with correction filter overlay
-        H_db_for_chart = valid_amps if valid_results else amp_array
-        png_bytes = build_multichart_png(
+        # Build multi-chart (3 panels: response + smoothed trend / deviation sigma / correction factor)
+        png_bytes, _, _ = build_multichart_png(
             freqs=freq_array,
-            H_db=H_db_for_chart,
-            correction_filter=W_complex,
+            H_db=H_db_input,
+            num_neighbors=cfg.smoothing_neighbors,
             title="Send Calibration Response (v2)",
         )
 
@@ -599,22 +591,28 @@ def main():
 
         npz_path = save_cal_profile(
             output_dir, "v2_cal_send", metadata,
-            response_H=amp_linear[:len(freq_array)],
+            response_H=valid_amps if valid_results else amp_array,
             freqs=freq_array,
+            correction_filter=None,  # corrected via saved per-bin factors instead
         )
         print(f"  Profile saved: {npz_path}")
+
+        # Save smoothed data and correction factors to profile NPZ
+        correction_npz_path = output_dir / "v2_cal_send_corrections.npz"
+        np.savez(
+            str(correction_npz_path),
+            freqs=freq_array,
+            response_H_linear=np.maximum(valid_amps if valid_results else amp_array, -200),
+            smoothed_H_db=smoothed_db,
+            correction_factor=corr_factors,
+            mean_H_linear=np.array([mean_linear]),
+        )
+        print(f"  Correction factors saved : {correction_npz_path}")
 
         # Save multi-chart PNG alongside profile
         chart_path = output_dir / "v2_cal_send_chart.png"
         chart_path.write_bytes(png_bytes)
-        print(f"  Chart saved : {chart_path}")
-
-        save_cal_profile(
-            output_dir, "v2_cal_send", metadata,
-            correction_filter=W_complex, ir=ir, response_H=H_complex, freqs=freq_array,
-        )
-        print(f"  Correction filter saved alongside profile.")
-        print(f"  FIR length: {len(ir)} samples")
+        print(f"  Chart saved            : {chart_path}")
 
     print("\n[Done]")
 

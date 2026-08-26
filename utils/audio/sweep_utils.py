@@ -273,14 +273,18 @@ def compute_inverse_filter(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Compute regularized inverse correction filter W(f).
 
-    W(f) = conj(H(f)) / max(|H(f)|, tol)
+    W(f) = conj(H(f)) / |H(f)|^2  — true magnitude + phase inverse.
+
+    Magnitude is 1/|H(f)| so the chart shows what boost/attenuation each bin needs.
+    Phase is -phase(H(f)) to cancel measured phase distortion.
 
     Returns:
         W: complex frequency-domain filter (same length as H)
         ir: time-domain FIR impulse response (length fft_len)
     """
     H_mag = np.abs(H)
-    W = np.conj(H) / np.maximum(H_mag, _REG_TOL)
+    # Full inverse: magnitude 1/|H|, phase -phase(H)
+    W = np.conj(H) / np.maximum(H_mag ** 2, _REG_TOL)
 
     # IFFT to get FIR impulse response
     ir = np.fft.ifft(W, n=fft_len).real

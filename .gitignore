@@ -1,1 +1,6 @@
 __pycache__/
+logs/
+
+
+# To be removed from gitignore later
+data/
