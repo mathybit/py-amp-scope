@@ -102,6 +102,33 @@ def compute_correction(H_lin):
     return np.conj(H_lin) / H_mag
 
 
+def extract_tone_measurements(rec, freqs, tone_duration_s, gap_s, fs):
+    """Extract per-tone dBFS measurements and RMS from raw capture data.
+
+    Splits ``rec`` into per-frequency segments using hop = (tone_duration + gap) * fs,
+    runs FFT on each segment, returns measured dBFS and RMS arrays.
+
+    Returns:
+        measured: np.ndarray of dBFS at each target frequency (NaN for short/missing segments)
+        rms_list: np.ndarray of RMS values per bin
+    """
+    hop = int((tone_duration_s + gap_s) * fs)
+    n_bins = len(freqs)
+    measured = np.full(n_bins, float("nan"))
+    rms_list = np.full(n_bins, 0.0)
+
+    for i in range(n_bins):
+        seg_start = i * hop
+        seg_end = min(seg_start + int(tone_duration_s * fs), len(rec))
+        seg = rec[seg_start:seg_end]
+        if len(seg) < 64:
+            continue
+        rms_list[i] = float(np.sqrt(np.mean(seg ** 2)))
+        measured[i] = fft_db(seg, freqs[i], fs)
+
+    return measured, rms_list
+
+
 def deviation_report(measured, freqs, label, send_correction_applied=False, receive_correction_applied=None):
     """Print frequency deviation report for a single measurement set."""
     valid = measured[~np.isnan(measured)]

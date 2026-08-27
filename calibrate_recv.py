@@ -41,31 +41,7 @@ from config import config as cfg  # noqa: E402
 from utils.audio.analysis_utils import fft_db, analyze_noise_response, smooth_moving_average
 from utils.audio.signal_utils import generate_noise_signal, play_one_freq_single, play_one_freq_seq, print_freq_table
 from utils.charting_utils import build_multichart_png
-from utils.file_utils import save_cal_profile
-
-
-# ---------------------------------------------------------------------------
-# Helper: load send correction factors
-# ---------------------------------------------------------------------------
-def _load_send_corrections(data_dir: Path) -> np.ndarray:
-    """Load per-bin send correction factors from pre-computed calibration output.
-
-    Returns correction_factor array or exits with error if not found.
-    """
-    search_paths = [
-        data_dir / "cal_send_corrections.npz",
-        _REPO_ROOT / "data" / "cal_send_corrections.npz",
-        Path.cwd() / "data" / "cal_send_corrections.npz",
-        _REPO_ROOT / "logs" / "cal_send_corrections.npz",
-    ]
-    for p in search_paths:
-        if p.exists():
-            d = np.load(str(p))
-            factors = d["correction_factor"]
-            print(f"  Loaded send corrections from : {p}")
-            return factors
-    print("ERROR: cal_send_corrections.npz not found. Run calibrate_send.py first.", file=sys.stderr)
-    sys.exit(1)
+from utils.file_utils import save_cal_profile, load_send_corrections
 
 
 # ---------------------------------------------------------------------------
@@ -234,15 +210,13 @@ def main():
 
     variant = "corr" if args.correct_send else "base"
 
-    #base_tone = float(cfg.tone_amplitude) * (float(send_gain) / 100.0)  # e.g. 0.2 * 0.70 = 0.14
-
     # Print frequency table
     print_freq_table(freq_array, fs, args.mode, tone_duration=tone_duration, gap_s=gap_s)
     
     print(f"  Base tone amplitude (unscaled) : {tone_amplitude:.4f}")
     if args.correct_send:
         # Apply send-correction factors
-        send_corr_factors = _load_send_corrections(output_dir)[:num_freqs]
+        send_corr_factors = load_send_corrections(output_dir)[:num_freqs]
         print("  Using send-corrected amplitudes")
         print(f"  Corrected amp range            : {send_corr_factors.min() * tone_amplitude:.4f} - {send_corr_factors.max() * tone_amplitude:.4f}")
         max_correction = float(np.max(send_corr_factors[:num_freqs]))
@@ -370,7 +344,7 @@ def main():
                 print(f"\r  [{bar}] {pct:5.1f}% ({i + 1}/{num_freqs}) {target_freq:.1f}Hz", end="", flush=True)
 
                 # Build per-frequency amplitude for sequential mode
-                corr_factor_i = corr_factors[i] if i < len(amp_factors) else 1.0
+                corr_factor_i = send_corr_factors[i] if i < len(send_corr_factors) else 1.0
                 try:
                     rec_flat = play_one_freq_seq(
                         freq=target_freq, duration_s=tone_duration, fs=fs,
@@ -501,7 +475,7 @@ def main():
 
         # Smoothing: centered moving average over nearest neighbors for correction factor
         H_db_input = valid_amps if valid_results else amp_array
-        smoothed_db = _smooth_moving_average(H_db_input, window_size=cfg.smoothing_neighbors)
+        smoothed_db = smooth_moving_average(H_db_input, window_size=cfg.smoothing_neighbors)
 
         # Correction factor in linear space: correction = mean_linear / smoothed_linear
         mean_db_val = float(np.mean(H_db_input))

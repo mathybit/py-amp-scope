@@ -30,6 +30,8 @@ _REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 from config import config as cfg  # noqa: E402
+from utils.audio.analysis_utils import deviation_report, extract_tone_measurements  # noqa: E402
+from utils.audio.signal_utils import play_one_freq_single  # noqa: E402
 from utils.charting_utils import build_validate_chart_png  # noqa: E402
 
 
@@ -79,192 +81,31 @@ def parse_args(argv=None):
 
 
 # ---------------------------------------------------------------------------
-# ToneSwitcher — re-used from calibrate_send_v2.py / validate_send_calibration.py
-# ---------------------------------------------------------------------------
-class _ToneSwitcher:
-    """Manages per-frequency tone segments for a single OutputStream."""
-
-    def __init__(self, freqs, duration_s, fs, gap_s, amp_factors):
-        self.fs = fs
-        self.tone_duration_s = duration_s
-        self.gap_samples = int(gap_s * fs)
-        offset = 0
-        self.tone_starts = []
-        self.tone_arrays = []
-        for i, freq in enumerate(freqs):
-            tone_samples = int(duration_s * fs)
-            t = np.arange(tone_samples) / fs
-            self.tone_arrays.append(
-                (np.sin(2 * np.pi * freq * t) * amp_factors[i]).astype(np.float64)
-            )
-            self.tone_starts.append(offset)
-            offset += tone_samples + self.gap_samples
-        self.total_out_samples = offset
-
-
-# ---------------------------------------------------------------------------
 # Analysis helpers
 # ---------------------------------------------------------------------------
-def _deviation_report(measured, freqs, label, correction_applied=False):
-    """Print frequency deviation report for a single measurement set."""
-    valid = measured[~np.isnan(measured)]
-    if len(valid) < 2:
-        print(f"\n{label} -- insufficient data")
-        return
-
-    mean_db = float(np.mean(valid))
-    std_db = float(np.std(valid))
-    min_db = float(np.min(valid))
-    max_db = float(np.max(valid))
-
-    # Convert dBFS to linear magnitude for percent-deviation calculation
-    lin = 10 ** (valid / 20.0)
-    arith_mean = float(np.mean(lin))
-
-    abs_pct_dev = np.abs((lin - arith_mean) / max(arith_mean, 1e-30) * 100.0)
-
-    print(f"\n{'=' * 56}")
-    print(f"  {label} -- Frequency Deviation Report")
-    print(f"{'=' * 56}")
-    print(f"  Correction applied  : {'Yes' if correction_applied else 'No'}")
-    print(f"  Valid bins          : {len(valid)}/{len(measured)}")
-    print()
-    print(f"  Amplitude stats:")
-    print(f"    Mean (dBFS)       : {mean_db:.2f} dBFS")
-    print(f"    Std deviation     : {std_db:.3f} dB")
-    print(f"    Range             : {min_db:.2f} - {max_db:.2f} dB (span={max_db-min_db:.2f} dB)")
-    print()
-    print(f"  Deviation from arithmetic mean (linear magnitude):")
-    print(f"    Mean abs % dev   : {float(np.mean(abs_pct_dev)):.3f}%")
-    print(f"    Median abs % dev : {float(np.median(abs_pct_dev)):.3f}%")
-    print(f"    Max abs % dev    : {float(np.max(abs_pct_dev)):.3f}%")
-    print(f"    Std of abs % dev : {float(np.std(abs_pct_dev)):.3f}%")
-
-    # Octave-band breakdown
-    print(f"\n  Octave band std deviation (linear %):")
-    octaves = [(20, 100, "sub-bass"), (100, 300, "bass"), (300, 800, "low-mid"),
-               (800, 2000, "mid"), (2000, 5000, "upper-mid"), (5000, 10000, "presence"),
-               (10000, 20000, "brilliance")]
-    for lo, hi, name in octaves:
-        mask = (freqs >= lo) & (freqs < hi)
-        if np.sum(mask) > 0:
-            seg_lin = lin[mask]
-            s_std_pct = float(np.std(seg_lin / arith_mean * 100.0))
-            print(f"    {name:>14} {lo:>5}-{hi:>6} Hz: std_dev%={s_std_pct:.3f}% bins={np.sum(mask)}")
-
-    # Worst offenders
-    sorted_idx = np.argsort(-abs_pct_dev)
-    print(f"\n  Top 5 worst bins:")
-    for rank in range(min(5, len(sorted_idx))):
-        j = sorted_idx[rank]
-        if np.isnan(measured[j]):
-            continue
-        print(f"    #{rank + 1}  {freqs[j]:>8.0f} Hz  =>  "
-              f"{measured[j]:>7.2f} dBFS  abs_dev={abs_pct_dev[j]:.3f}%")
 
 
 # ---------------------------------------------------------------------------
-# Hardware measurement — single-capture mode (like validate_send_calibration.py)
+# Hardware measurement — single-capture mode (delegates to play_one_freq_single)
 # ---------------------------------------------------------------------------
-def _measure_all_single_capture(freqs, tone_duration, gap_s, fs, send_gain, amp_factors, verbose=False):
-    """Send tones for all frequencies via single OutputStream + InputStream capture.
+def _measure_all_single_capture(freqs, tone_duration, gap_s, fs, corr_factors, verbose=False):
+    """Send tones via shared play function and analyze captured signal.
 
-    Returns array of measured dBFS at each target frequency.
+    Returns ``(rec_flat, measured_dBFS)`` where *measured_dBFS* has NaN for
+    short/missing segments.
     """
-    switcher = _ToneSwitcher(freqs, tone_duration, fs, gap_s, amp_factors)
-    total_out_samples = switcher.total_out_samples
-    total_s = total_out_samples / fs
-    in_offset = [0]
-    out_offset = [0]
-    capture_data = np.empty(total_out_samples, dtype="float32")
+    n_samples = int((tone_duration + gap_s) * fs * len(freqs))
+    capture_data = np.empty(n_samples, dtype="float32")
 
-    def _in_cb(indata, frame_count, time_flag, status):
-        n = min(frame_count, len(capture_data) - in_offset[0])
-        capture_data[in_offset[0] : in_offset[0] + n] = indata.flatten()[:n].astype(np.float32)
-        in_offset[0] += n
-
-    def _out_cb(outdata, frame_count, time_flag, status):
-        start = out_offset[0]
-        end = min(start + frame_count, total_out_samples)
-        n = min(frame_count, end - start)
-        buf = np.zeros(n, dtype=np.float64)
-        for i in range(len(switcher.tone_arrays)):
-            t_start = switcher.tone_starts[i]
-            t_end = t_start + len(switcher.tone_arrays[i])
-            lo = max(start, t_start)
-            hi = min(end, t_end)
-            if lo < hi:
-                t_lo = lo - t_start
-                t_hi = hi - t_start
-                buf[lo - start : hi - start] = switcher.tone_arrays[i][t_lo:t_hi]
-
-        if outdata.ndim == 1:
-            outdata[:n] = buf
-        else:
-            outdata[:n, 0] = buf
-        out_offset[0] = end
-        return (outdata, "continue")
-
-    out_stream = sd.OutputStream(
-        device=cfg.send_device, samplerate=fs, channels=1,
-        callback=_out_cb, blocksize=512, latency="low",
+    rec_flat = play_one_freq_single(
+        freqs=freqs, duration_s=tone_duration, fs=fs, gap_s=gap_s,
+        send_device=cfg.send_device, recv_device=cfg.recv_device,
+        send_gain=cfg.send_gain, tone_amplitude=float(cfg.tone_amplitude),
+        corr_factors=corr_factors, capture_data=capture_data, verbose=verbose,
     )
-    in_stream = sd.InputStream(
-        device=cfg.recv_device, samplerate=fs, channels=1,
-        callback=_in_cb, blocksize=512, latency="low",
-    )
-    out_stream.start()
-    in_stream.start()
 
-    elapsed = 0
-    last_reported_s = -1.0
-    while in_offset[0] < total_out_samples and elapsed < total_s * 3:
-        if verbose and (elapsed - last_reported_s) >= 0.5:
-            pct = in_offset[0] / total_out_samples * 100
-            bar_len = 20
-            filled = int(bar_len * in_offset[0] / total_out_samples)
-            bar = "=" * filled + "-" * (bar_len - filled)
-            print(f"\r  Capturing [{bar}] {pct:5.1f}% ({elapsed:.0f}/{total_s:.0f}s)", end="", flush=True)
-            last_reported_s = elapsed
-        sd.sleep(100)
-        elapsed += 0.1
-
-    if verbose:
-        print(f"\r  Capturing [{'=' * 20}] 100.0% ({total_s:.0f}/{total_s:.0f}s)\n", flush=True)
-
-    out_stream.stop()
-    in_stream.stop()
-    out_stream.close()
-    in_stream.close()
-
-    rec = capture_data[:in_offset[0]].astype(float)
-
-    # Analyze each tone segment
-    hop = int((tone_duration + gap_s) * fs)
-    measured = np.full(len(freqs), float("nan"))
-    n_bins = len(freqs)
-    for i, target_freq in enumerate(freqs):
-        if verbose:
-            pct = (i + 1) / n_bins * 100
-            bar_len = 30
-            filled = int(bar_len * pct / 100)
-            bar = "=" * filled + "-" * (bar_len - filled)
-            print(f"\r  Analyzing [{bar}] {pct:5.1f}% ({i + 1}/{n_bins})", end="", flush=True)
-        seg_start = i * hop
-        seg_end = min(seg_start + int(tone_duration * fs), len(rec))
-        seg = rec[seg_start:seg_end]
-        if len(seg) < 64:
-            continue
-        fft_vals = np.abs(np.fft.rfft(seg.astype(float)))
-        freq_bins_arr = np.fft.rfftfreq(len(seg), d=1.0 / fs)
-        idx = np.argmin(np.abs(freq_bins_arr - target_freq))
-        measured[i] = 20 * np.log10(max(fft_vals[idx], 1e-10))
-
-    # Clear analysis progress line
-    if verbose:
-        print(f"\r  Analyzing [" + "=" * 30 + f"] 100.0% ({n_bins}/{n_bins})\n", flush=True)
-
-    return rec, measured
+    measured, _ = extract_tone_measurements(rec_flat, freqs, tone_duration, gap_s, fs)
+    return rec_flat, measured
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +182,9 @@ def main():
         cal_path = Path(args.cal_file)
     elif not recv_corr:
         # Default for baseline: use corr variant (the "gold standard" calibrated profile)
+        # TODO: This loads the 'corr' variant even when no corrections are requested.
+        # It should default to 'base_profile.npz' instead, with 'corr' only loaded via --cal-file override.
+        # Not critical now since we use corr as reference for validation, but worth cleaning up later.
         cal_path = _REPO_ROOT / "data" / f"cal_recv_{recv_path}_corr_profile.npz"
     else:
         cal_path = profile_for_recv_corr
@@ -369,29 +213,25 @@ def main():
     print(f"  Tone duration     : {tone_duration}s")
     print(f"  Mode              : {args.mode}")
 
-    # Compute per-tone amplitude factors for sending
-    base_tone = float(cfg.tone_amplitude) * float(cfg.send_gain) / 100.0  # e.g. 0.2 * 0.70 = 0.14
-
+    # Determine per-tone corr_factors for play_one_freq_single (ToneSwitcher handles amp + gain internally)
     if send_corr:
-        # Load send correction factors to scale sent tones
         send_corr_path = _REPO_ROOT / "data" / "cal_send_corrections.npz"
         if not send_corr_path.exists():
             print(f"ERROR: Send corrections file not found: {send_corr_path}")
             sys.exit(1)
         send_data = np.load(str(send_corr_path))
-        send_factors = send_data["correction_factor"]
-        amp_factors = base_tone * send_factors[:n_bins]
-        print(f"\n  Sent tones: send-corrected (amp range {amp_factors.min():.4f} - {amp_factors.max():.4f})")
+        amp_factors = send_data["correction_factor"][:n_bins]
+        print(f"\n  Sent tones: send-corrected (corr range {amp_factors.min():.3f} - {amp_factors.max():.3f})")
     else:
-        # Baseline: send uniform tone at the same amplitude used in calibration
-        amp_factors = np.full(n_bins, base_tone, dtype=np.float64)
-        print(f"\n  Sent tones: uniform (amp = {amp_factors[0]:.4f})")
+        # Baseline: uniform tone (corr_factors = 1.0)
+        amp_factors = np.ones(n_bins, dtype=np.float64)
+        print(f"\n  Sent tones: uniform (corr_factor = 1.0)")
 
     # Measure via hardware
     print(f"\n[{args.mode} mode: sending {n_bins} tones...]\n", flush=True)
     rec, measured = _measure_all_single_capture(
         freqs=freqs_cal, tone_duration=tone_duration, gap_s=gap_s,
-        fs=fs, send_gain=cfg.send_gain, amp_factors=amp_factors, verbose=True,
+        fs=fs, corr_factors=amp_factors, verbose=True,
     )
 
     # Apply receive corrections to measured results (post-correction)
@@ -448,7 +288,7 @@ def main():
     print(f"Chart saved : {chart_path}")
 
     # Report
-    _deviation_report(measured, freqs_cal, f"Receive Validation ({label})", recv_corr_applied)
+    deviation_report(measured, freqs_cal, f"Receive Validation ({label})", send_correction_applied=send_corr, receive_correction_applied=recv_corr_applied)
 
     return measured
 

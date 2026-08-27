@@ -58,3 +58,24 @@ def save_cal_profile(
     meta_path.write_text(json.dumps(meta_for_json, indent=2, default=str))
 
     return npz_path
+
+
+def load_send_corrections(data_dir: Path) -> np.ndarray:
+    """Load per-bin send correction factors from pre-computed calibration output.
+
+    Returns correction_factor array or exits with error if not found.
+    """
+    search_paths = [
+        data_dir / "cal_send_corrections.npz",
+        _REPO_ROOT / "data" / "cal_send_corrections.npz",
+        Path.cwd() / "data" / "cal_send_corrections.npz",
+        _REPO_ROOT / "logs" / "cal_send_corrections.npz",
+    ]
+    for p in search_paths:
+        if p.exists():
+            d = np.load(str(p))
+            factors = d["correction_factor"]
+            print(f"  Loaded send corrections from : {p}")
+            return factors
+    print("ERROR: cal_send_corrections.npz not found. Run calibrate_send.py first.", file=sys.stderr)
+    sys.exit(1)
