@@ -1,21 +1,21 @@
 #!/usr/bin/env python
-"""Validate send-path calibration by measuring frequency deviation with/without correction.
+"""Validate receive-path calibration by measuring frequency deviation across 4 configurations.
 
-Loads the send calibration profile (cal_send_profile.npz), sends a uniform tone at each
-bin frequency, and measures how far each returned amplitude deviates from the mean across all
-bins. Two modes:
+Tests combinations of send-correction and receive-correction to answer:
+does applying receive calibration corrections actually lower std deviation?
 
-  Default (no --correct-send): sends uncorrected signal; shows raw deviation of the calibration
-                               profile.
-
-  --correct-send: loads per-bin correction factors from the saved NPZ file and applies them to the
-                  sent tone amplitudes, then measures how much flatter the returned signal is.
-
-The script answers: is the send circuitry uniform enough that calibration matters?
+Four configurations (labelled cc/cb/bc/bb):
+  --correct-send   --correct-recv   |  label   | behavior
+  no               no               |  bb      | uniform tone, raw measurement
+  yes              no               |  cb      | send-corrected tone, raw measurement
+  no               yes              |  bc      | uniform tone, receive corrections applied
+  yes              yes              |  cc      | send-corrected tone, receive corrections applied
 
 Usage:
-    python validate_send_calibration.py              # baseline measurement (no correction)
-    python validate_send_calibration.py --correct-send      # with send-correction applied
+    python validate_recv_calibration.py                          # bb (baseline)
+    python validate_recv_calibration.py --correct-send           # cb (send corrected)
+    python validate_recv_calibration.py --correct-recv           # bc (recv corrected)
+    python validate_recv_calibration.py --correct-send --correct-recv  # cc (both)
 """
 
 import argparse
@@ -38,25 +38,34 @@ from utils.charting_utils import build_validate_chart_png  # noqa: E402
 # ---------------------------------------------------------------------------
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Validate send-path calibration frequency response.",
+        description="Validate receive-path calibration frequency response across 4 config combinations.",
         epilog=(
             "Error metric: absolute percent deviation of each bin's amplitude from the "
-            "arithmetic mean across all bins. A lower stddev means the correction is working.\n\n"
-            "With --correct-send, an inverse filter is computed on-the-fly from the calibration "
-            "profile and applied to the sent signal before each tone."
+            "arithmetic mean across all bins. The cc vs cb comparison answers whether "
+            "receive corrections lower std deviation.\n\n"
+            "With --correct-send, send-correction factors are applied to sent tones.\n"
+            "With --correct-recv, receive correction factors (from the cal_recv_*_corr_profile.npz) "
+            "are loaded and applied to measured results."
         ),
     )
     parser.add_argument(
         "--cal-file", type=str, default=None,
-        help="Path to cal_send_profile.npz (default: data/cal_send_profile.npz)",
+        help="Path to a specific profile NPZ (default: auto-select based on --correct-recv)",
     )
     parser.add_argument(
         "--correct-send", action="store_true",
         help="Apply send-correction factors (from cal_send_corrections.npz) to sent tones.",
     )
     parser.add_argument(
-        "--mode", choices=["sequential", "single-capture"], default="sequential",
-        help="Capture mode (default: sequential)",
+        "--correct-recv", action="store_true",
+        help="Load receive calibration corrections and apply them to measured results. "
+             "Requires a receive profile with corrections: cal_recv_{path}_corr_profile.npz.",
+    )
+    parser.add_argument("--recv-path", choices=["dir", "iso"], default=None,
+                        help="Receive path variant (default: config value 'dir')")
+    parser.add_argument(
+        "--mode", choices=["sequential", "single-capture"], default="single-capture",
+        help="Capture mode (default: single-capture)",
     )
     parser.add_argument("--tone-duration", type=float, default=None,
                         help=f"Tone duration per frequency in seconds (config: {cfg.tone_duration})")
@@ -70,7 +79,7 @@ def parse_args(argv=None):
 
 
 # ---------------------------------------------------------------------------
-# ToneSwitcher — re-used from calibrate_send_v2.py
+# ToneSwitcher — re-used from calibrate_send_v2.py / validate_send_calibration.py
 # ---------------------------------------------------------------------------
 class _ToneSwitcher:
     """Manages per-frequency tone segments for a single OutputStream."""
@@ -96,18 +105,7 @@ class _ToneSwitcher:
 # ---------------------------------------------------------------------------
 # Analysis helpers
 # ---------------------------------------------------------------------------
-def _compute_correction(H_lin):
-    """Compute regularized inverse correction filter from linear magnitude response.
-
-    Returns W (complex frequency-domain, unit-magnitude phase-flipped) — not used for
-    direct waveform scaling here but available if the user wants to inspect it later.
-    """
-    tol = 1e-3
-    H_mag = np.maximum(np.abs(H_lin), tol)
-    return np.conj(H_lin) / H_mag
-
-
-def _deviation_report(measured, freqs, label, correct_send_applied=False):
+def _deviation_report(measured, freqs, label, correction_applied=False):
     """Print frequency deviation report for a single measurement set."""
     valid = measured[~np.isnan(measured)]
     if len(valid) < 2:
@@ -128,7 +126,7 @@ def _deviation_report(measured, freqs, label, correct_send_applied=False):
     print(f"\n{'=' * 56}")
     print(f"  {label} -- Frequency Deviation Report")
     print(f"{'=' * 56}")
-    print(f"  Correction applied  : {'Yes' if correct_send_applied else 'No'}")
+    print(f"  Correction applied  : {'Yes' if correction_applied else 'No'}")
     print(f"  Valid bins          : {len(valid)}/{len(measured)}")
     print()
     print(f"  Amplitude stats:")
@@ -166,7 +164,7 @@ def _deviation_report(measured, freqs, label, correct_send_applied=False):
 
 
 # ---------------------------------------------------------------------------
-# Hardware measurement — single-capture mode (like calibrate_send_v2.py)
+# Hardware measurement — single-capture mode (like validate_send_calibration.py)
 # ---------------------------------------------------------------------------
 def _measure_all_single_capture(freqs, tone_duration, gap_s, fs, send_gain, amp_factors, verbose=False):
     """Send tones for all frequencies via single OutputStream + InputStream capture.
@@ -232,7 +230,7 @@ def _measure_all_single_capture(freqs, tone_duration, gap_s, fs, send_gain, amp_
         elapsed += 0.1
 
     if verbose:
-        print(f"\r  Capturing [{'' + '=' * 20}] 100.0% ({total_s:.0f}/{total_s:.0f}s)\n", flush=True)
+        print(f"\r  Capturing [{'=' * 20}] 100.0% ({total_s:.0f}/{total_s:.0f}s)\n", flush=True)
 
     out_stream.stop()
     in_stream.stop()
@@ -272,25 +270,38 @@ def _measure_all_single_capture(freqs, tone_duration, gap_s, fs, send_gain, amp_
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-# Corrected signal (no correction) or pre-corrected signal (with inverse correction).
-# With --correct, loads per-bin correction factors from the calibration profile if available.
+def _load_corrections(data_dir: Path, logs_dir: Path, recv_path: str):
+    """Load per-bin receive correction factors from pre-computed calibration output.
 
-def _load_corrections(data_dir, logs_dir):
-    """Load pre-computed correction factors from the calibration output directory.
-
-    Returns a tuple of (correction_factors, loaded_from_file) or (None, False) if not found.
+    Returns (correction_factors, loaded_from_file) or (None, False) if not found.
+    Tries cal_recv_{path}_corr_corrections.npz first, then _corrections.npz fallback.
     """
-    # Try standard paths for corrections NPZ (in priority order)
-    correction_paths = [
-        data_dir / "cal_send_corrections.npz",
-        logs_dir / "cal_send_corrections.npz",
-        _REPO_ROOT / "data" / "cal_send_corrections.npz",
-        _REPO_ROOT / "logs" / "cal_send_corrections.npz",
+    # Try "corr" variant first (explicit receive corrections file)
+    prefix = f"cal_recv_{recv_path}_corr_corrections"
+    search_paths = [
+        data_dir / f"{prefix}.npz",
+        logs_dir / f"{prefix}.npz",
+        _REPO_ROOT / "data" / f"{prefix}.npz",
+        _REPO_ROOT / "logs" / f"{prefix}.npz",
     ]
-    for path in correction_paths:
+    for path in search_paths:
         if path.exists():
-            data = np.load(str(path))
-            factors = data["correction_factor"]
+            d = np.load(str(path))
+            factors = d["correction_factor"]
+            return factors, str(path)
+
+    # Fallback: try _corrections.npz (old naming, before variant suffix was added)
+    prefix_old = f"cal_recv_{recv_path}_corrections"
+    search_paths = [
+        data_dir / f"{prefix_old}.npz",
+        logs_dir / f"{prefix_old}.npz",
+        _REPO_ROOT / "data" / f"{prefix_old}.npz",
+        _REPO_ROOT / "logs" / f"{prefix_old}.npz",
+    ]
+    for path in search_paths:
+        if path.exists():
+            d = np.load(str(path))
+            factors = d["correction_factor"]
             return factors, str(path)
     return None, False
 
@@ -298,20 +309,50 @@ def _load_corrections(data_dir, logs_dir):
 def main():
     args = parse_args()
 
-    # Locate calibration profile
-    if args.cal_file:
+    # Resolve receive path
+    recv_path = args.recv_path if args.recv_path else cfg.recv_path
+
+    # Determine config label (cc/cb/bc/bb)
+    send_corr = args.correct_send
+    recv_corr = args.correct_recv
+    label = "bb"  # baseline-send, baseline-recv
+    if send_corr:
+        label = "cb"  # corrected-send, baseline-recv
+    if recv_corr:
+        label = ("bc" if not send_corr else "cc")  # bc or cc
+
+    # Determine which profile to load for --correct-recv
+    profile_for_recv_corr = None
+    if args.cal_file and recv_corr:
+        profile_for_recv_corr = Path(args.cal_file)
+    elif recv_corr:
+        # Default: use the corr variant of the receive profile
+        profile_for_recv_corr = _REPO_ROOT / "data" / f"cal_recv_{recv_path}_corr_profile.npz"
+
+    # Validate: --correct-recv requires a profile with corrections to exist
+    if recv_corr and not profile_for_recv_corr.exists():
+        print(f"WARNING: Receive calibration profile not found at:\n  {profile_for_recv_corr}")
+        print("Falling back to on-the-fly correction from raw data (may be inaccurate).")
+        recv_corr = False
+
+    # Load config calibration profile for measurement
+    cal_dir = Path(cfg.data_dir)
+    if args.cal_file and not recv_corr:
         cal_path = Path(args.cal_file)
+    elif not recv_corr:
+        # Default for baseline: use corr variant (the "gold standard" calibrated profile)
+        cal_path = _REPO_ROOT / "data" / f"cal_recv_{recv_path}_corr_profile.npz"
     else:
-        cal_path = _REPO_ROOT / "data" / "cal_send_profile.npz"
+        cal_path = profile_for_recv_corr
 
     if not cal_path.exists():
-        print(f"ERROR: Calibration profile not found: {cal_path}")
-        print("Run calibrate_send_v2.py first to generate one.")
+        print(f"ERROR: Receive calibration profile not found: {cal_path}")
+        print("Run calibrate_recv.py first to generate one.")
         sys.exit(1)
 
     data = np.load(cal_path, allow_pickle=True)
-    freqs_cal = data["frequencies"]  # target frequencies from calibration
-    H_db_raw = data["response_H"]     # measured dBFS at each target
+    freqs_cal = data["frequencies"]     # target frequencies from calibration
+    H_db_raw = data["response_H"]       # measured dBFS at each target
     fs = int(cfg.fs)
 
     n_bins = len(freqs_cal)
@@ -320,40 +361,31 @@ def main():
     tone_duration = float(args.tone_duration) if args.tone_duration is not None else float(cfg.tone_duration)
     gap_s = float(args.gap) if args.gap is not None else float(cfg.tone_gap)
 
-    correct_send_applied = args.correct
-
-    print(f"Calibration profile : {cal_path}")
+    print(f"Receive profile     : {cal_path}")
+    print(f"  Path variant      : {recv_path}")
+    print(f"  Config            : {label} (send-correct={send_corr}, recv-correct={recv_corr})")
     print(f"  Bins              : {n_bins}")
     print(f"  Freq range        : {freqs_cal[0]:.1f} - {freqs_cal[-1]:.1f} Hz")
-    print(f"  Send correction   : {'Yes' if correct_send_applied else 'No'}")
     print(f"  Tone duration     : {tone_duration}s")
     print(f"  Mode              : {args.mode}")
 
-    # Compute per-tone amplitude factors
-    # The correction factors from the profile are dimensionless multipliers (e.g. 1.2 means "boost by 20%").
-    # We multiply them by the base tone amplitude (tone_amplitude * send_gain/100) to get the actual DAC output.
-    # This ensures validate sends signals at the same absolute level as calibrate_send_v2.
+    # Compute per-tone amplitude factors for sending
     base_tone = float(cfg.tone_amplitude) * float(cfg.send_gain) / 100.0  # e.g. 0.2 * 0.70 = 0.14
 
-    if correct_send_applied:
-        # Try loading pre-computed correction factors from profile first
-        corr_factors, path = _load_corrections(Path(cfg.data_dir), Path(cfg.logs_dir))
-        if corr_factors is not None and len(corr_factors) == n_bins:
-            print(f"  Loaded corrections from : {path}")
-            amp_factors = base_tone * np.array(corr_factors)
-        else:
-            # Fallback: compute on-the-fly from raw profile (H_mean / H_smoothed via pct_diff)
-            print("  Note: no pre-computed corrections found; computing on-the-fly from profile.")
-            H_linear = 10 ** (H_db_raw / 20.0)
-            H_mean_linear = float(np.mean(H_linear))
-            amp_factors = base_tone * np.where(
-                H_linear > 1e-6,
-                H_mean_linear / H_linear * np.ones(n_bins),
-                np.ones(n_bins),
-            )
+    if send_corr:
+        # Load send correction factors to scale sent tones
+        send_corr_path = _REPO_ROOT / "data" / "cal_send_corrections.npz"
+        if not send_corr_path.exists():
+            print(f"ERROR: Send corrections file not found: {send_corr_path}")
+            sys.exit(1)
+        send_data = np.load(str(send_corr_path))
+        send_factors = send_data["correction_factor"]
+        amp_factors = base_tone * send_factors[:n_bins]
+        print(f"\n  Sent tones: send-corrected (amp range {amp_factors.min():.4f} - {amp_factors.max():.4f})")
     else:
         # Baseline: send uniform tone at the same amplitude used in calibration
         amp_factors = np.full(n_bins, base_tone, dtype=np.float64)
+        print(f"\n  Sent tones: uniform (amp = {amp_factors[0]:.4f})")
 
     # Measure via hardware
     print(f"\n[{args.mode} mode: sending {n_bins} tones...]\n", flush=True)
@@ -362,16 +394,37 @@ def main():
         fs=fs, send_gain=cfg.send_gain, amp_factors=amp_factors, verbose=True,
     )
 
+    # Apply receive corrections to measured results (post-correction)
+    recv_corr_applied = False
+    if recv_corr:
+        corr_factors, loaded_from = _load_corrections(Path(cfg.data_dir), Path(cfg.logs_dir), recv_path)
+        if corr_factors is not None and len(corr_factors) == n_bins:
+            print(f"\n  Applying receive corrections from: {loaded_from}")
+            # Correction factors are linear multipliers; convert dBFS → linear → correct → back to dBFS
+            H_lin = 10 ** (measured / 20.0)
+            H_corr_lin = H_lin * corr_factors
+            measured = 20 * np.log10(H_corr_lin)
+            recv_corr_applied = True
+        else:
+            # Fallback: compute on-the-fly from raw profile (H_mean_linear / H_linear)
+            print("\n  Note: no pre-computed corrections found; computing on-the-fly from profile.")
+            H_linear = 10 ** (H_db_raw / 20.0)
+            H_mean_linear = float(np.mean(H_linear))
+            corr_factors = np.where(H_linear > 1e-6, H_mean_linear / H_linear, np.ones(n_bins))
+            H_lin = 10 ** (measured / 20.0)
+            measured = 20 * np.log10(H_lin * corr_factors)
+            recv_corr_applied = True
+
     # Save WAV
     output_dir = Path(args.output_dir) if args.output_dir else _REPO_ROOT / "logs"
     output_dir.mkdir(exist_ok=True)
 
-    label_suffix = "corr_send" if correct_send_applied else "base"
-    wav_path = output_dir / f"validate_{label_suffix}_captured.wav"
+    label_suffix = f"{recv_path}_{label}"
+    wav_path = output_dir / f"validate_recv_{label_suffix}_captured.wav"
     wavfile.write(str(wav_path), fs, rec.astype(np.float32))
     print(f"\nWAV saved: {wav_path}")
 
-    # Build deviation metrics for chart
+    # Build deviation metrics for chart (from measured results, post receive-correction if applied)
     valid_mask = ~np.isnan(measured)
     mean_db = float(np.mean(measured[valid_mask]))
     std_db = float(np.std(measured[valid_mask]))
@@ -386,16 +439,16 @@ def main():
         freqs=freqs_cal[valid_mask],
         deviation_db=deviation_db[valid_mask],
         pct_dev=pct_dev[valid_mask],
-        title=f"Send Validation {'(Send-Corrected)' if correct_send_applied else '(Baseline)'}",
+        title=f"Receive Validation ({label.upper()}) -- {recv_path}",
     )
 
     # Save chart PNG
-    chart_path = output_dir / f"validate_{label_suffix}_chart.png"
+    chart_path = output_dir / f"validate_recv_{label_suffix}_chart.png"
     chart_path.write_bytes(chart_png)
     print(f"Chart saved : {chart_path}")
 
     # Report
-    _deviation_report(measured, freqs_cal, "Validation Result", correct_send_applied)
+    _deviation_report(measured, freqs_cal, f"Receive Validation ({label})", recv_corr_applied)
 
     return measured
 

@@ -258,6 +258,12 @@ def parse_args(argv=None):
     parser.add_argument("--recv-path", choices=["dir", "iso"], default=None,
                         help="Receive path variant (default: config value 'dir')")
 
+    parser.add_argument(
+        "--correct-send", action="store_true", default=False,
+        help="Apply send-correction factors (from cal_send_corrections.npz) to sent tones. "
+             "Default: uniform tone (baseline).",
+    )
+
     # Frequency range parameters
     parser.add_argument("--freq-min", type=int, default=None, help=f"Lowest analysis frequency Hz (config: {cfg.freq_min})")
     parser.add_argument("--freq-max", type=int, default=None, help=f"Highest analysis frequency Hz (config: {cfg.freq_max})")
@@ -380,20 +386,30 @@ def main():
     print(f"  Recv path         : {recv_path}")
     print(f"  Output dir        : {output_dir}")
     print("=" * 60)
+    mode_label = "send-corrected" if args.correct_send else "baseline (uniform tone)"
+    print(f"  Mode: {mode_label}")
 
-    # Load send correction factors (critical — this is what differentiates receive from send calibration)
-    send_corr_factors = _load_send_corrections(output_dir)
+    variant = "corr" if args.correct_send else "base"
+
     base_tone = float(cfg.tone_amplitude) * (float(send_gain) / 100.0)  # e.g. 0.2 * 0.70 = 0.14
 
-    # Send-corrected amplitudes at each frequency: base_tone * corr_factor[f]
-    # These should produce a flat signal after send DI effects cancel out
-    amp_factors = base_tone * send_corr_factors[:num_freqs]  # clip to our bin count
+    if args.correct_send:
+        # Apply send-correction factors
+        send_corr_factors = _load_send_corrections(output_dir)
+        amp_factors = base_tone * send_corr_factors[:num_freqs]  # clip to our bin count
+        print("  Using send-corrected amplitudes")
+    else:
+        # Baseline: uniform tone, no send correction applied
+        amp_factors = np.full(num_freqs, base_tone, dtype=np.float64)
+        print("  Using uniform tone amplitudes (no send correction)")
 
     print(f"  Base tone amplitude (unscaled) : {base_tone:.4f}")
-    print(f"  Send-corrected amp range       : {amp_factors.min():.4f} - {amp_factors.max():.4f}")
-    if base_tone > 0:
+    if args.correct_send:
+        print(f"  Corrected amp range            : {amp_factors.min():.4f} - {amp_factors.max():.4f}")
         max_correction = float(np.max(send_corr_factors[:num_freqs]))
         print(f"  Max send correction factor     : {max_correction:.3f} ({max_correction * 100 - 100:+.1f}%)")
+    else:
+        print(f"  Uniform amp value              : {amp_factors[0]:.4f}")
 
     # Print frequency table
     _print_freq_table(freq_array, fs, args.mode, recv_path=recv_path,
@@ -414,7 +430,7 @@ def main():
         print("\n[Sequential mode: one OutputStream+InputStream per frequency]")
 
         # Save WAV capture per-frequency files
-        wave_dir = output_dir / f"cal_recv_{recv_path}_captured"
+        wave_dir = output_dir / f"cal_recv_{recv_path}_{variant}_captured"
         try:
             shutil.rmtree(wave_dir, ignore_errors=True)
         except Exception as e:
@@ -499,7 +515,7 @@ def main():
         print(f"\nCaptured {len(rec_flat)} samples ({len(rec_flat)/fs:.1f}s), RMS={np.sqrt(np.mean(rec_flat**2)):.6f}")
 
         # Save WAV capture file (single combined file in data/ root)
-        wave_path = output_dir / f"cal_recv_{recv_path}_captured.wav"
+        wave_path = output_dir / f"cal_recv_{recv_path}_{variant}_captured.wav"
         wavfile.write(str(wave_path), fs, rec_flat.astype(np.float32))
         print(f"\n  WAV saved : {wave_path}")
 
@@ -570,12 +586,12 @@ def main():
             freqs=freq_array,
             H_db=H_db_input,
             num_neighbors=cfg.smoothing_neighbors,
-            title=f"Receive DI Response ({recv_path}) Calibration",
+            title=f"Receive DI Response ({recv_path}) Calibration {'(send-corrected)' if args.correct_send else '(uniform tone)'}",
         )
 
         # Save profile NPZ (directly in output_dir)
         npz_path = save_cal_profile(
-            output_dir, f"cal_recv_{recv_path}", metadata,
+            output_dir, f"cal_recv_{recv_path}_{variant}", metadata,
             response_H=valid_amps if valid_results else amp_array,
             freqs=freq_array,
             correction_filter=None,  # corrected via saved per-bin factors instead
@@ -583,7 +599,7 @@ def main():
         print(f"  Profile saved: {npz_path}")
 
         # Save smoothed data and correction factors to corrections NPZ
-        correction_npz_path = output_dir / f"cal_recv_{recv_path}_corrections.npz"
+        correction_npz_path = output_dir / f"cal_recv_{recv_path}_{variant}_corrections.npz"
         np.savez(
             str(correction_npz_path),
             freqs=freq_array,
@@ -595,7 +611,7 @@ def main():
         print(f"  Correction factors saved : {correction_npz_path}")
 
         # Save multi-chart PNG alongside profile
-        chart_path = output_dir / f"cal_recv_{recv_path}_chart.png"
+        chart_path = output_dir / f"cal_recv_{recv_path}_{variant}_chart.png"
         chart_path.write_bytes(png_bytes)
         print(f"  Chart saved            : {chart_path}")
 
