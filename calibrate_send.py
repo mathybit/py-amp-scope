@@ -8,7 +8,7 @@ Inverse correction filter is ALWAYS computed and saved alongside the profile.
 
 Two operating modes:
   sequential  : one OutputStream+InputStream pair per frequency (like v1, but with callbacks)
-  single-capture : one OutputStream + one InputStream for all frequencies;
+  single : Single-Capture Mode - one OutputStream + one InputStream for all frequencies;
                    OutputStream switches tones during the recording. Faster, no stream
                    lifecycle overhead between bins.
 
@@ -16,7 +16,7 @@ After calibration, run validate_send_calibration.py to verify whether the correc
 worth applying by measuring frequency deviation before and after correction.
 
 Usage:
-    python calibrate_send.py --mode single-capture   # faster, recommended
+    python calibrate_send.py --mode single   # faster, recommended
     python calibrate_send.py --mode sequential        # per-frequency streams
     python calibrate_send.py --dry-run                # show config and frequency table only
 """
@@ -38,241 +38,10 @@ _REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 from config import config as cfg  # noqa: E402
-from utils.audio.sweep_utils import save_cal_profile
-from utils.charting_utils import build_multichart_png, _smooth_moving_average  # noqa: E402
-
-
-# ---------------------------------------------------------------------------
-# Frequency table
-# ---------------------------------------------------------------------------
-def _print_freq_table(freqs, fs, mode, tone_duration=1.0, gap_s=0.3):
-    """Print a formatted frequency table."""
-    spacing = "log" if np.all(np.diff(np.log10(freqs)) > 0) else "linear"
-
-    border = "=" * 52
-    title = f"PyAmpScope -- {spacing.capitalize()} Spaced Frequencies ({mode} mode)"
-    print(f"\n{title}")
-    print(border)
-    print(f"  Sample rate   : {fs} Hz")
-    if mode == "sequential":
-        est_total = len(freqs) * (tone_duration + gap_s)
-        print(f"  Mode          : sequential (one OutputStream/InputStream per freq)")
-        print(f"  Est. duration : ~{est_total:.0f}s at {tone_duration:.1f}s tone + {gap_s:.1f}s gap")
-
-    col_w = 52
-    print(f"\n{'Bin':>4}  {'Frequency (Hz)':>16}  {'Samples per wave period':>20}")
-    print("-" * col_w)
-
-    for i, f in enumerate(freqs):
-        samples_per_cycle = fs / f
-        print(f"{i + 1:>4}  {f:>12.1f} Hz  | {samples_per_cycle:>9.0f} samples/period")
-
-    border2 = "=" * col_w
-    print(border2)
-    print(f"{'Total':>4} bins : {len(freqs)}")
-
-
-# ---------------------------------------------------------------------------
-# Sequential mode helpers — per-frequency OutputStream/InputStream
-# ---------------------------------------------------------------------------
-def _play_one_freq_seq(
-    freq: float, duration_s: float, fs: int,
-    send_device: Optional[int], recv_device: Optional[int],
-    send_gain: float, tone_amplitude: float,
-) -> np.ndarray:
-    """Play a single frequency and capture it via separate OutputStream/InputStream per call.
-
-    Returns the captured signal as a numpy array.
-    """
-    n_samples = int(duration_s * fs)
-    t_total = np.arange(n_samples) / fs
-    tone_full = (np.sin(2 * np.pi * freq * t_total) * tone_amplitude).astype(np.float64)
-
-    out_offset = [0]
-    in_offset = [0]
-    capture_data = np.empty(n_samples, dtype="float32")
-
-    def _out_cb(outdata, frame_count, time_flag, status):
-        if status:
-            print(f"    [Output status: {status}]", flush=True)
-        start = out_offset[0]
-        end = min(start + frame_count, len(tone_full))
-        n = min(frame_count, end - start)
-        gain_factor = send_gain / 100.0
-        scaled_tone = tone_full[start:end] * gain_factor
-        if outdata.ndim == 1:
-            outdata[:n] = scaled_tone
-        else:
-            outdata[:n, 0] = scaled_tone
-        if end < len(tone_full):
-            outdata[n:] = 0.0
-            out_offset[0] = end
-            return (outdata, "continue")
-        else:
-            outdata[n:] = 0.0
-            return outdata
-
-    def _in_cb(indata, frame_count, time_flag, status):
-        if status:
-            print(f"    [Input status: {status}]", flush=True)
-        n = min(frame_count, len(capture_data) - in_offset[0])
-        capture_data[in_offset[0] : in_offset[0] + n] = indata.flatten()[:n].astype(np.float32)
-        in_offset[0] += n
-
-    try:
-        out_stream = sd.OutputStream(
-            device=send_device, samplerate=fs, channels=1,
-            callback=_out_cb, blocksize=512, latency="low",
-        )
-        in_stream = sd.InputStream(
-            device=recv_device, samplerate=fs, channels=1,
-            callback=_in_cb, blocksize=512, latency="low",
-        )
-        out_stream.start()
-        in_stream.start()
-
-        elapsed = 0
-        while in_offset[0] < n_samples and elapsed < int(duration_s * 3):
-            sd.sleep(100)
-            elapsed += 0.1
-
-        out_stream.stop()
-        in_stream.stop()
-        out_stream.close()
-        in_stream.close()
-    except Exception as e:
-        raise RuntimeError(f"Stream error at {freq:.1f}Hz: {e}") from e
-
-    rec_flat = capture_data[: in_offset[0]].astype(float)
-    return rec_flat
-
-
-# ---------------------------------------------------------------------------
-# Single-capture mode helpers — one OutputStream that switches tones
-# ---------------------------------------------------------------------------
-class _ToneSwitcher:
-    """Manages per-frequency tone segments for a single OutputStream."""
-
-    def __init__(self, freqs, duration_s, fs, gap_s, tone_amplitude):
-        self.fs = fs
-        self.tone_duration_s = duration_s
-        self.gap_samples = int(gap_s * fs)
-        self.total_out_samples = 0
-
-        offset = 0
-        self.tone_starts = []
-        self.tone_arrays = []
-        for freq in freqs:
-            tone_samples = int(duration_s * fs)
-            t = np.arange(tone_samples) / fs
-            self.tone_arrays.append(
-                (np.sin(2 * np.pi * freq * t) * tone_amplitude).astype(np.float64)
-            )
-            self.tone_starts.append(offset)
-            offset += tone_samples + self.gap_samples
-        self.total_out_samples = offset
-
-def _play_one_freq_single(
-    freqs, duration_s, fs, gap_s,
-    send_device, recv_device, send_gain, tone_amplitude,
-    capture_data, verbose=False,
-):
-    """Run a single-capture cycle: one OutputStream switching tones + one InputStream.
-
-    Returns the captured signal (already written into capture_data array).
-    """
-    switcher = _ToneSwitcher(freqs, duration_s, fs, gap_s, tone_amplitude)
-    total_out_samples = switcher.total_out_samples
-    total_s = total_out_samples / fs
-    in_offset = [0]
-    out_offset = [0]
-
-    def _in_cb(indata, frame_count, time_flag, status):
-        if status:
-            print(f"    [Input status: {status}]", flush=True)
-        n = min(frame_count, len(capture_data) - in_offset[0])
-        capture_data[in_offset[0] : in_offset[0] + n] = indata.flatten()[:n].astype(np.float32)
-        in_offset[0] += n
-
-    def _out_cb(outdata, frame_count, time_flag, status):
-        if status:
-            print(f"    [Output status: {status}]", flush=True)
-
-        start = out_offset[0]
-        end = min(start + frame_count, total_out_samples)
-        n = min(frame_count, end - start)
-
-        buf = np.zeros(n, dtype=np.float64)
-        gain_factor = send_gain / 100.0
-        for i in range(len(switcher.tone_arrays)):
-            t_start = switcher.tone_starts[i]
-            t_end = t_start + len(switcher.tone_arrays[i])
-            lo = max(start, t_start)
-            hi = min(end, t_end)
-            if lo < hi:
-                t_lo = lo - t_start
-                t_hi = hi - t_start
-                buf[lo - start : hi - start] = switcher.tone_arrays[i][t_lo:t_hi] * gain_factor
-
-        if outdata.ndim == 1:
-            outdata[:n] = buf
-        else:
-            outdata[:n, 0] = buf
-        out_offset[0] = end
-
-        if out_offset[0] >= switcher.total_out_samples:
-            return outdata
-        return (outdata, "continue")
-
-    try:
-        out_stream = sd.OutputStream(
-            device=send_device, samplerate=fs, channels=1,
-            callback=_out_cb, blocksize=512, latency="low",
-        )
-        in_stream = sd.InputStream(
-            device=recv_device, samplerate=fs, channels=1,
-            callback=_in_cb, blocksize=512, latency="low",
-        )
-        out_stream.start()
-        in_stream.start()
-
-        elapsed = 0
-        last_reported_s = -1.0
-        while in_offset[0] < total_out_samples and elapsed < total_s * 3:
-            if verbose and (elapsed - last_reported_s) >= 0.5:
-                pct = in_offset[0] / total_out_samples * 100
-                bar_len = 50
-                filled = int(bar_len * in_offset[0] / total_out_samples)
-                bar = "=" * filled + "-" * (bar_len - filled)
-                print(f"\r  Capturing [{bar}] {pct:5.1f}% ({elapsed:.0f}/{total_s:.0f}s)", end="", flush=True)
-                last_reported_s = elapsed
-            sd.sleep(100)
-            elapsed += 0.1
-
-        if verbose:
-            print(f"\r  Capturing [{'' + '=' * bar_len}] 100.0% ({total_s:.0f}/{total_s:.0f}s)\n", flush=True)
-
-        out_stream.stop()
-        in_stream.stop()
-        out_stream.close()
-        in_stream.close()
-    except Exception as e:
-        raise RuntimeError(f"Single-capture stream error: {e}") from e
-
-    rec_flat = capture_data[: in_offset[0]].astype(float)
-    return rec_flat
-
-
-# ---------------------------------------------------------------------------
-# FFT analysis helper
-# ---------------------------------------------------------------------------
-def _fft_db(sig, target_hz, fs):
-    """Get dB value at target frequency via FFT."""
-    N = len(sig)
-    fft_vals = np.abs(np.fft.rfft(sig.astype(float)))
-    freqs = np.fft.rfftfreq(N, d=1.0 / fs)
-    idx = np.argmin(np.abs(freqs - target_hz))
-    return 20 * np.log10(max(fft_vals[idx], 1e-10))
+from utils.audio.analysis_utils import fft_db, analyze_noise_response, smooth_moving_average
+from utils.audio.signal_utils import generate_noise_signal, play_one_freq_single, play_one_freq_seq, print_freq_table
+from utils.charting_utils import build_multichart_png
+from utils.file_utils import save_cal_profile
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +54,7 @@ def parse_args(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Modes:\n"
-            "  single-capture : One OutputStream switches tones, one InputStream captures all.\n"
+            "  single : Single-Capture Mode - one OutputStream switches tones, one InputStream captures all.\n"
             "                   Faster (~30s for 60 bins). Recommended.\n"
             "  sequential     : One OutputStream+InputStream pair per frequency. More robust\n"
             "                   on hardware with unstable PortAudio state between streams.\n"
@@ -293,10 +62,10 @@ def parse_args(argv=None):
     )
 
     parser.add_argument(
-        "--mode", choices=["sequential", "single-capture"], default="single-capture",
-        help="Capture mode (default: single-capture)",
+        "--mode", choices=["sequential", "single"], default="single",
+        help="Capture mode (default: single)",
     )
-    parser.add_argument("--method", choices=["sweep", "multitone", "pink", "white"],
+    parser.add_argument("--method", choices=["sweep", "pink", "white", "brown"],
                         default=None, help="Calibration signal type (from config by default)")
     parser.add_argument("--freq-min", type=int, default=None, help=f"Lowest analysis frequency Hz (config: {cfg.freq_min})")
     parser.add_argument("--freq-max", type=int, default=None, help=f"Highest analysis frequency Hz (config: {cfg.freq_max})")
@@ -407,23 +176,23 @@ def main():
 
     print("=" * 60)
     print(f"PyAmpScope Send Calibration Profile (v2)")
-    print(f"  Method     : {method}")
-    print(f"  Mode       : {args.mode} (OutputStream/InputStream callbacks)")
+    print(f"  Method       : {method}")
+    print(f"  Mode         : {args.mode} (OutputStream/InputStream callbacks)")
     print(f"  Tone duration: {tone_duration}s")
-    print(f"  Gap        : {gap_s}s between tones")
-    print(f"  Sample rate: {fs} Hz")
-    print(f"  Freq range : {freq_min}-{freq_max} Hz")
-    print(f"  Send device: {send_device}")
-    print(f"  Recv device: {recv_device}")
-    print(f"  Send gain  : {send_gain}%")
-    print(f"  Recv gain  : {recv_gain}%")
-    print(f"  Send ch    : {send_ch} (phase-2: not yet applied to streams)")
-    print(f"  Recv ch    : {recv_ch} (phase-2: not yet applied to streams)")
-    print(f"  Output dir : {output_dir}")
+    print(f"  Gap          : {gap_s}s between tones")
+    print(f"  Sample rate  : {fs} Hz")
+    print(f"  Freq range   : {freq_min}-{freq_max} Hz")
+    print(f"  Send device  : {send_device}")
+    print(f"  Recv device  : {recv_device}")
+    print(f"  Send gain    : {send_gain}%")
+    print(f"  Recv gain    : {recv_gain}%")
+    print(f"  Send ch      : {send_ch} (phase-2: not yet applied to streams)")
+    print(f"  Recv ch      : {recv_ch} (phase-2: not yet applied to streams)")
+    print(f"  Output dir   : {output_dir}")
     print("=" * 60)
 
     # Print frequency table
-    _print_freq_table(freq_array, fs, args.mode, tone_duration=tone_duration, gap_s=gap_s)
+    print_freq_table(freq_array, fs, args.mode, tone_duration=tone_duration, gap_s=gap_s)
 
     if args.dry_run:
         print("\n[Dry run -- skipping hardware play/capture and file writes.]")
@@ -433,100 +202,194 @@ def main():
     # -----------------------------------------------------------------------
     # Run calibration
     # -----------------------------------------------------------------------
-    print(f"\n[{num_freqs} frequencies across {args.mode} mode...]", flush=True)
-    results = []  # list of (freq, amplitude_db)
+
+    results = []  # list of (freq, amplitude_db, rms) per target frequency
     valid_results = []
 
-    if args.mode == "sequential":
-        print("\n[Sequential mode: one OutputStream+InputStream per frequency]")
+    if method in ("pink", "white", "brown"):
+        # Broadband noise pipeline: generate 60s continuous signal, stream + capture, analyze via FFT.
+        print(f"\n[{method.upper()} noise calibration: generating and streaming {cfg.noise_calibration_time}-second noise signal...]", flush=True)
+        n_samples = fs * cfg.noise_calibration_time  # capture duration
 
-        # Save WAV capture per-frequency files
-        wave_dir = output_dir / "cal_send_captured"
-        try:
-            shutil.rmtree(wave_dir, ignore_errors=True)
-        except Exception as e:
-            pass
-        wave_dir.mkdir(exist_ok=True)
+        # Generate noise signal
+        noise_signal = generate_noise_signal(
+            method=method, n_samples=n_samples, fs=int(fs),
+            tone_amplitude=float(cfg.tone_amplitude), send_gain=float(send_gain),
+        )
+        clip_ratio = float(np.sum(np.abs(noise_signal) > 0.99)) / len(noise_signal) * 100
 
-        for i, target_freq in enumerate(freq_array):
-            pct = (i + 1) / num_freqs * 100
-            bar_len = 50
-            filled = int(bar_len * pct / 100)
-            bar = "=" * filled + "-" * (bar_len - filled)
-            print(f"\r  [{bar}] {pct:5.1f}% ({i + 1}/{num_freqs}) {target_freq:.1f}Hz", end="", flush=True)
-            try:
-                rec_flat = _play_one_freq_seq(
-                    freq=target_freq, duration_s=tone_duration, fs=fs,
-                    send_device=send_device, recv_device=recv_device,
-                    send_gain=send_gain, tone_amplitude=tone_amplitude,
-                )
-            except Exception as e:
-                print(f"\n  [ERROR: {e}]", flush=True)
-                results.append((target_freq, float("nan"), 0.0))
-                continue
+        print(f"  Signal: {len(noise_signal)} samples ({len(noise_signal)/fs:.1f}s), RMS={np.sqrt(np.mean(noise_signal**2)):.6f}, clip={clip_ratio:.3f}%")
 
-            if len(rec_flat) == 0:
-                print(f"  [SKIP: no data]", flush=True)
-                results.append((target_freq, float("nan"), 0.0))
-                continue
+        if clip_ratio > 0.5:
+            print("  WARNING: Signal exceeds 0.99 threshold -- check gain settings.")
 
-            rms = float(np.sqrt(np.mean(rec_flat**2)))
-            db_target = _fft_db(rec_flat, target_freq, fs)
-            results.append((target_freq, db_target, rms))
-            #print(f"  Captured {len(rec_flat)} samples @ {fs}Hz", flush=True)
-            print(f"  RMS={rms:.6f}  {target_freq:.1f}Hz@{db_target:.1f}dBFS", end="", flush=True)
-
-            # Save WAV capture per-frequency file
-            wave_path = wave_dir / f"freq_{i:03d}.wav"
-            wavfile.write(str(wave_path), fs, rec_flat.astype(np.float32))
-
-        print("\n", flush=True)
-
-    else:
-        # Single-capture mode
-        n_samples = int(total_s * fs)
+        # Stream + capture via OutputStream/InputStream callbacks
+        out_offset = [0]
+        in_offset = [0]
         capture_data = np.empty(n_samples, dtype="float32")
 
-        print(f"\n[{total_s:.1f}s of simultaneous recording active]", flush=True)
-        try:
-            rec_flat = _play_one_freq_single(
-                freqs=freq_array, duration_s=tone_duration, fs=fs, gap_s=gap_s,
-                send_device=send_device, recv_device=recv_device,
-                send_gain=send_gain, tone_amplitude=tone_amplitude,
-                capture_data=capture_data, verbose=True,
-            )
-        except Exception as e:
-            print(f"\n  [ERROR during single-capture: {e}]", file=sys.stderr)
-            sys.exit(1)
+        def _noise_in_cb(indata, frame_count, time_flag, status):
+            n = min(frame_count, len(capture_data) - in_offset[0])
+            if n > 0:
+                capture_data[in_offset[0] : in_offset[0] + n] = indata.flatten()[:n].astype(np.float32)
+            in_offset[0] += n
 
-        # Analyze each tone window in the captured signal
-        hop = int((tone_duration + gap_s) * fs)
-        for i, target_freq in enumerate(freq_array):
-            pct = (i + 1) / num_freqs * 100
-            bar_len = 50
-            filled = int(bar_len * pct / 100)
-            bar = "=" * filled + "-" * (bar_len - filled)
-            print(f"\r  Analyzing [{bar}] {pct:5.1f}% ({i + 1}/{num_freqs})", end="", flush=True)
-            seg_start = i * hop
-            seg_end = min(seg_start + int(tone_duration * fs), len(rec_flat))
-            seg = rec_flat[seg_start:seg_end]
+        def _noise_out_cb(outdata, frame_count, time_flag, status):
+            start = out_offset[0]
+            end = min(start + frame_count, len(noise_signal))
+            n = min(frame_count, end - start)
+            buf = np.zeros(n, dtype=np.float64)
+            buf[:n] = noise_signal[start:end]
+            if outdata.ndim == 1:
+                outdata[:n] = buf
+            else:
+                outdata[:n, 0] = buf
+            out_offset[0] = end
+            return (outdata, "continue")
 
-            if len(seg) < 64:
-                results.append((target_freq, float("nan"), 0.0))
-                continue
+        in_stream = sd.InputStream(device=int(recv_device), samplerate=int(fs), channels=1, callback=_noise_in_cb, blocksize=512, latency="low")
+        out_stream = sd.OutputStream(device=int(send_device), samplerate=int(fs), channels=1, callback=_noise_out_cb, blocksize=512, latency="low")
+        in_stream.start()
+        out_stream.start()
 
-            rms = float(np.sqrt(np.mean(seg**2))) if len(seg) > 0 else 0.0
-            db_target = _fft_db(seg, target_freq, fs)
-            results.append((target_freq, db_target, rms))
+        elapsed_s = 0
+        while in_offset[0] < n_samples and elapsed_s < n_samples / fs * 1.5:
+            sd.sleep(100)
+            elapsed_s += 0.1
+            if int(elapsed_s) % 10 == 0:
+                pct = in_offset[0] / n_samples * 100
+                bar_len = 20
+                filled = int(bar_len * in_offset[0] / n_samples)
+                bar = "=" * filled + "-" * (bar_len - filled)
+                print(f"\r  Capturing [{bar}] {pct:5.1f}% ({elapsed_s:.0f}/{n_samples/fs:.0f}s)", end="", flush=True)
 
-        # Clear analysis progress line
-        print("\r  Analyzing [" + "=" * bar_len + f"] 100.0% ({num_freqs}/{num_freqs})\n", flush=True)
-        print(f"\nCaptured {len(rec_flat)} samples ({len(rec_flat)/fs:.1f}s), RMS={np.sqrt(np.mean(rec_flat**2)):.6f}")
+        if in_offset[0] < n_samples:
+            print(f"\n  WARNING: Capture incomplete ({in_offset[0]}/{n_samples} samples)")
 
-        # Save WAV capture file (single combined file in data/ root)
+        out_stream.stop()
+        in_stream.stop()
+        out_stream.close()
+        in_stream.close()
+
+        # Clear progress line
+        print(f"\r  Capturing [{'=' * 20}] 100.0% ({in_offset[0]}/{n_samples} samples)\n", flush=True)
+
+        rec_flat = capture_data[:in_offset[0]].astype(float)
+        print(f"  Captured {len(rec_flat)} samples ({len(rec_flat)/fs:.1f}s), RMS={np.sqrt(np.mean(rec_flat**2)):.6f}")
+
+        # Analyze via FFT
+        freqs_out, amp_db_all, rms_all = analyze_noise_response(captured_signal=rec_flat, freq_array=freq_array, fs=int(fs))
+        for f_val, a_val, r_val in zip(freqs_out, amp_db_all, rms_all):
+            results.append((f_val, a_val, r_val))
+
+        # Save single combined WAV capture
         wave_path = output_dir / "cal_send_captured.wav"
-        wavfile.write(str(wave_path), fs, rec_flat.astype(np.float32))
+        wavfile.write(str(wave_path), int(fs), rec_flat.astype(np.float32))
         print(f"\n  WAV saved : {wave_path}")
+
+        # Print progress per-bin (noise method does a single FFT, no per-tone bar needed)
+        valid_count = sum(1 for _, a, _ in results if not np.isnan(a))
+        print(f"  FFT analysis complete: {valid_count}/{len(results)} bins measured\n")
+
+    elif method in ("sweep"):
+        # Tone-based pipeline (sequential or single-capture mode)
+        print(f"\n[{num_freqs} frequencies across {args.mode} mode...]", flush=True)
+        results = []  # list of (freq, amplitude_db)
+        valid_results = []
+
+        if args.mode == "sequential":
+            print("\n[Sequential mode: one OutputStream+InputStream per frequency]")
+
+            # Save WAV capture per-frequency files
+            wave_dir = output_dir / "cal_send_captured"
+            try:
+                shutil.rmtree(wave_dir, ignore_errors=True)
+            except Exception as e:
+                pass
+            wave_dir.mkdir(exist_ok=True)
+
+            for i, target_freq in enumerate(freq_array):
+                pct = (i + 1) / num_freqs * 100
+                bar_len = 50
+                filled = int(bar_len * pct / 100)
+                bar = "=" * filled + "-" * (bar_len - filled)
+                print(f"\r  [{bar}] {pct:5.1f}% ({i + 1}/{num_freqs}) {target_freq:.1f}Hz", end="", flush=True)
+                try:
+                    rec_flat = play_one_freq_seq(
+                        freq=target_freq, duration_s=tone_duration, fs=fs,
+                        send_device=send_device, recv_device=recv_device,
+                        send_gain=send_gain, tone_amplitude=tone_amplitude, corr_factor=None
+                    )
+                except Exception as e:
+                    print(f"\n  [ERROR: {e}]", flush=True)
+                    results.append((target_freq, float("nan"), 0.0))
+                    continue
+
+                if len(rec_flat) == 0:
+                    print(f"  [SKIP: no data]", flush=True)
+                    results.append((target_freq, float("nan"), 0.0))
+                    continue
+
+                rms = float(np.sqrt(np.mean(rec_flat**2)))
+                db_target = fft_db(rec_flat, target_freq, fs)
+                results.append((target_freq, db_target, rms))
+                #print(f"  Captured {len(rec_flat)} samples @ {fs}Hz", flush=True)
+                print(f"  RMS={rms:.6f}  {target_freq:.1f}Hz@{db_target:.1f}dBFS", end="", flush=True)
+
+                # Save WAV capture per-frequency file
+                wave_path = wave_dir / f"freq_{i:03d}.wav"
+                wavfile.write(str(wave_path), fs, rec_flat.astype(np.float32))
+
+            print("\n", flush=True)
+
+        elif args.mode == "single":
+            # Single-capture mode
+            n_samples = int(total_s * fs)
+            capture_data = np.empty(n_samples, dtype="float32")
+
+            print(f"\n[{total_s:.1f}s of simultaneous recording active]", flush=True)
+            try:
+                rec_flat = play_one_freq_single(
+                    freqs=freq_array, duration_s=tone_duration, fs=fs, gap_s=gap_s,
+                    send_device=send_device, recv_device=recv_device,
+                    send_gain=send_gain, tone_amplitude=tone_amplitude,
+                    capture_data=capture_data, verbose=True,
+                )
+            except Exception as e:
+                print(f"\n  [ERROR during single capture: {e}]", file=sys.stderr)
+                sys.exit(1)
+
+            # Analyze each tone window in the captured signal
+            hop = int((tone_duration + gap_s) * fs)
+            for i, target_freq in enumerate(freq_array):
+                pct = (i + 1) / num_freqs * 100
+                bar_len = 50
+                filled = int(bar_len * pct / 100)
+                bar = "=" * filled + "-" * (bar_len - filled)
+                print(f"\r  Analyzing [{bar}] {pct:5.1f}% ({i + 1}/{num_freqs})", end="", flush=True)
+                seg_start = i * hop
+                seg_end = min(seg_start + int(tone_duration * fs), len(rec_flat))
+                seg = rec_flat[seg_start:seg_end]
+
+                if len(seg) < 64:
+                    results.append((target_freq, float("nan"), 0.0))
+                    continue
+
+                rms = float(np.sqrt(np.mean(seg**2))) if len(seg) > 0 else 0.0
+                db_target = fft_db(seg, target_freq, fs)
+                results.append((target_freq, db_target, rms))
+
+            # Clear analysis progress line
+            print("\r  Analyzing [" + "=" * bar_len + f"] 100.0% ({num_freqs}/{num_freqs})\n", flush=True)
+            print(f"\nCaptured {len(rec_flat)} samples ({len(rec_flat)/fs:.1f}s), RMS={np.sqrt(np.mean(rec_flat**2)):.6f}")
+
+            # Save WAV capture file (single combined file in data/ root)
+            wave_path = output_dir / "cal_send_captured.wav"
+            wavfile.write(str(wave_path), fs, rec_flat.astype(np.float32))
+            print(f"\n  WAV saved : {wave_path}")
+
+        else:
+            raise NotImplementedError(f"Unsupported mode: {args.mode}")
 
 
     # -----------------------------------------------------------------------
@@ -582,7 +445,7 @@ def main():
 
         # Smoothing: centered moving average over nearest neighbors for correction factor
         H_db_input = valid_amps if valid_results else amp_array
-        smoothed_db = _smooth_moving_average(H_db_input, window_size=cfg.smoothing_neighbors)
+        smoothed_db = smooth_moving_average(H_db_input, window_size=cfg.smoothing_neighbors)
 
         # Correction factor in linear space: correction = mean_linear / smoothed_linear
         mean_db_val = float(np.mean(H_db_input))

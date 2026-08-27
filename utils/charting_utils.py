@@ -8,22 +8,7 @@ import io
 
 import numpy as np
 
-
-def _smooth_moving_average(arr: np.ndarray, window_size: int) -> np.ndarray:
-    """Centered moving average over *window_size* total points (including center).
-
-    Edge bins use whatever neighbors are available (no padding assumption).
-
-    Example: window_size=5 means +/-2 from the current bin. If fewer than 2 exist on
-    one side, only the available points are averaged.
-    """
-    half = window_size // 2
-    result = np.empty_like(arr)
-    for i in range(len(arr)):
-        lo = max(i - half, 0)
-        hi = min(i + half + 1, len(arr))
-        result[i] = np.mean(arr[lo:hi])
-    return result
+from .audio.analysis_utils import smooth_moving_average
 
 
 def build_multichart_png(
@@ -56,7 +41,7 @@ def build_multichart_png(
     deviation_sigma = deviation_db / max(std_db, 1e-10)
 
     # Smoothing for the correction factor — moving average over nearest neighbors
-    H_smoothed_db = _smooth_moving_average(H_mag_db, window_size=num_neighbors)
+    H_smoothed_db = smooth_moving_average(H_mag_db, window_size=num_neighbors)
 
     # Correction factor in linear space:
     #   correction = H_mean_linear / H_smoothed_linear
