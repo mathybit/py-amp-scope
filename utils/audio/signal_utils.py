@@ -271,8 +271,8 @@ def generate_noise_signal(method, n_samples, fs, tone_amplitude, send_gain):
     # Apply spectral shaping and random phases in frequency domain
     spectrum = mag * np.exp(1j * phases)
 
-    # Inverse FFT to time domain
-    time_signal = np.fft.ifft(spectrum).real
+    # Inverse FFT to time domain (irfft correctly reconstructs N samples from rfft output)
+    time_signal = np.fft.irfft(spectrum, n=N).real
 
     # Normalize RMS to target level
     current_rms = math.sqrt(np.mean(time_signal ** 2))
