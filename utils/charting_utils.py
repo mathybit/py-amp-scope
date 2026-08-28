@@ -143,3 +143,97 @@ def build_validate_chart_png(
     plt.close(fig)
     buf.seek(0)
     return buf.read()
+
+
+def build_noise_chart_png(
+    freqs: np.ndarray,
+    H_db: np.ndarray,
+    smoothed_db: np.ndarray,
+    expected_db: np.ndarray,
+    deviation_db: np.ndarray,
+    corr_factors: np.ndarray,
+    num_neighbors: int = 5,
+    title: str = "Noise Calibration Response",
+) -> bytes:
+    """Build a 3-panel PNG chart for pink/brown noise calibration.
+
+    Uses the theoretical input profile shifted to match measurement level as
+    reference for deviation and correction (percent-based).
+
+    Parameters
+    ----------
+    freqs : log-spaced frequency bins in Hz.
+    H_db : measured amplitude in dBFS at each bin (raw).
+    smoothed_db : smoothed measured amplitude (same window as ``num_neighbors``).
+    expected_db : theoretical spectral density of input noise method in dB (may be shifted).
+    deviation_db : smoothed_db - expected_db (dB from shifted reference, or percent if
+                   the caller computes it that way -- detected automatically).
+    corr_factors : per-bin correction factors to undo chain coloration.
+    num_neighbors : total points in moving average window (default 5 = +/-2).
+    title : chart title.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), dpi=120, sharex=True)
+    fig.suptitle(title, fontsize=14, fontweight="bold")
+
+    # Panel 1: Frequency response (raw + smoothed trend + theoretical reference)
+    ax = axes[0]
+    ax.set_ylabel("Magnitude (dB)")
+    ax.plot(freqs, H_db, "r-", linewidth=1.2, alpha=0.8, label="Measured (raw)")
+    ax.plot(freqs, smoothed_db, "g--", linewidth=1.5, alpha=0.7, label="Smoothed trend")
+    ax.plot(freqs, expected_db, "k:", linewidth=1.2, alpha=0.6, label="Theoretical input")
+    ax.grid(True, which="major", axis="x", alpha=0.3)
+    y_min = min(H_db.min(), smoothed_db.min(), expected_db.min())
+    y_max = max(H_db.max(), smoothed_db.max(), expected_db.max())
+    y_range = y_max - y_min
+    ax.set_ylim(y_min - y_range * 0.05, y_max + y_range * 0.05)
+    ax.legend(loc="upper right", fontsize=9)
+
+    # Panel 2: Deviation from theoretical profile (shifted to match measurement)
+    ax = axes[1]
+    # Auto-detect: if values are large (>50) they're likely percent, not dB
+    max_abs_dev = max(abs(deviation_db.max()), abs(deviation_db.min()))
+    is_pct = max_abs_dev > 50 or float(np.mean(np.abs(deviation_db))) > 10
+
+    if is_pct:
+        ax.set_ylabel("Deviation from theory (%)")
+        pct_thresh = max(max_abs_dev * 0.1, 5.0)  # sensible threshold for percent
+    else:
+        ax.set_ylabel("Deviation from theory (dB)")
+        pct_thresh = max(max_abs_dev * 0.25, 1.0)
+
+    ax.plot(freqs, deviation_db, "b-", linewidth=1.0, alpha=0.7)
+    ax.axhline(0, color="red", linewidth=0.8, linestyle="--")
+    ax.axhline(pct_thresh, color="orange", linewidth=0.5, linestyle=":", alpha=0.5)
+    ax.axhline(-pct_thresh, color="orange", linewidth=0.5, linestyle=":", alpha=0.5)
+    ax.grid(True, which="major", axis="x", alpha=0.3)
+    y_max_d = max(abs(deviation_db.max()), abs(deviation_db.min()))
+    if y_max_d > 0:
+        ax.set_ylim(-y_max_d * 1.05, y_max_d * 1.05)
+
+    # Panel 3: Correction factor (inverted chain coloration)
+    ax = axes[2]
+    ax.set_ylabel("Correction factor")
+    ax.plot(freqs, corr_factors, "m-", linewidth=1.2, alpha=0.8)
+    ax.axhline(1.0, color="gray", linewidth=0.8, linestyle="--")
+    ax.grid(True, which="major", axis="x", alpha=0.3)
+    y_min_c = min(corr_factors.min(), 0.95)
+    y_max_c = max(corr_factors.max(), 1.05)
+    y_range_c = y_max_c - y_min_c
+    ax.set_ylim(y_min_c - y_range_c * 0.05, y_max_c + y_range_c * 0.05)
+
+    axes[2].set_xlabel("Frequency (Hz)")
+    for ax in axes:
+        ax.set_xscale("log")
+        ax.set_xlim(max(freqs[0], 20), freqs[-1])
+
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read(), corr_factors, smoothed_db

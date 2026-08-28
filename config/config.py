@@ -19,8 +19,8 @@ fs = 44100             # default sample rate (USB interface lowest common)
 
 # Calibration settings
 min_calibration_time = 30      # minimum total calibration time in seconds
-noise_calibration_time = 60    # total time to capture broadband noise for pink/white/brown methods
-num_freqs_default = 160        # default frequency bin count (floor)
+noise_calibration_time = 30    # total time to capture broadband noise for pink/white/brown methods
+num_freqs_default = 60        # default frequency bin count (floor)
 tone_duration = 0.7            # per-tone duration in seconds
 tone_gap = 0.2                 # gap between tones in seconds
 tone_amplitude = 0.2           # base tone amplitude (before send_gain scaling)

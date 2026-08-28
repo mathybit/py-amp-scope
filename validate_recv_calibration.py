@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -30,9 +31,15 @@ _REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 from config import config as cfg  # noqa: E402
-from utils.audio.analysis_utils import deviation_report, extract_tone_measurements  # noqa: E402
-from utils.audio.signal_utils import play_one_freq_single  # noqa: E402
-from utils.charting_utils import build_validate_chart_png  # noqa: E402
+from utils.audio.analysis_utils import (  # noqa: E402
+    compare_noise_spectral_shape,
+    deviation_report,
+    extract_tone_measurements,
+    print_noise_shape_report,
+    smooth_moving_average,
+)
+from utils.audio.signal_utils import generate_noise_signal, play_one_freq_single  # noqa: E402
+from utils.charting_utils import build_noise_chart_png, build_validate_chart_png  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -66,8 +73,12 @@ def parse_args(argv=None):
     parser.add_argument("--recv-path", choices=["dir", "iso"], default=None,
                         help="Receive path variant (default: config value 'dir')")
     parser.add_argument(
+        "--method", choices=["sweep", "pink", "white", "brown"], default="sweep",
+        help="Calibration method (default: sweep / tone-based)",
+    )
+    parser.add_argument(
         "--mode", choices=["sequential", "single-capture"], default="single-capture",
-        help="Capture mode (default: single-capture)",
+        help="Capture mode for tone-based validation (default: single-capture)",
     )
     parser.add_argument("--tone-duration", type=float, default=None,
                         help=f"Tone duration per frequency in seconds (config: {cfg.tone_duration})")
@@ -150,6 +161,9 @@ def _load_corrections(data_dir: Path, logs_dir: Path, recv_path: str):
 def main():
     args = parse_args()
 
+    output_dir = Path(args.output_dir) if args.output_dir else _REPO_ROOT / "logs"
+    output_dir.mkdir(exist_ok=True)
+
     # Resolve receive path
     recv_path = args.recv_path if args.recv_path else cfg.recv_path
 
@@ -162,6 +176,210 @@ def main():
     if recv_corr:
         label = ("bc" if not send_corr else "cc")  # bc or cc
 
+    fs = int(cfg.fs)
+    n_samples_out = int(cfg.noise_calibration_time * fs)
+
+    # ------------------------------------------------------------------
+    # Noise capture path (pink / white / brown)
+    # ------------------------------------------------------------------
+    if args.method in ("pink", "white", "brown"):
+        print(f"\n[Noise validation -- receive path ({args.method}, method={args.method})]")
+
+        # Load calibration profile for reference freqs
+        cal_path = Path(args.cal_file) if args.cal_file else _REPO_ROOT / "data" / f"cal_recv_{recv_path}_corr_profile.npz"
+        if not cal_path.exists():
+            print(f"WARNING: Calibration profile not found at {cal_path}")
+            freq_array = np.logspace(math.log10(cfg.freq_min), math.log10(cfg.freq_max), cfg.num_freqs_default)
+        else:
+            data_ref = np.load(cal_path, allow_pickle=True)
+            freq_array = data_ref["frequencies"]
+
+        n_bins = len(freq_array)
+
+        # Load receive corrections (for post-correction comparison)
+        recv_corr_factors = None
+        if recv_corr:
+            profile_for_recv_corr = Path(args.cal_file) if args.cal_file else _REPO_ROOT / "data" / f"cal_recv_{recv_path}_corr_profile.npz"
+            if not profile_for_recv_corr.exists():
+                print(f"WARNING: Receive calibration profile not found at:\n  {profile_for_recv_corr}")
+                print("Falling back to on-the-fly correction from raw data (may be inaccurate).")
+                recv_corr = False
+            else:
+                corr_factors_loaded, loaded_from = _load_corrections(Path(cfg.data_dir), Path(cfg.logs_dir), recv_path)
+                if corr_factors_loaded is not None and len(corr_factors_loaded) == n_bins:
+                    recv_corr_factors = corr_factors_loaded
+                    print(f"  Receive corrections : from {loaded_from}")
+                else:
+                    # On-the-fly from profile
+                    prof_data = np.load(profile_for_recv_corr, allow_pickle=True)
+                    H_linear = 10 ** (prof_data["response_H"] / 20.0)
+                    recv_corr_factors = np.where(H_linear > 1e-6, np.mean(H_linear) / H_linear, np.ones(n_bins))
+                    print("  Receive corrections : computed on-the-fly from profile")
+
+        if send_corr:
+            send_corr_path = _REPO_ROOT / "data" / "cal_send_corrections.npz"
+            if not send_corr_path.exists():
+                print(f"ERROR: Send corrections file not found: {send_corr_path}")
+                sys.exit(1)
+            amp_factors = np.load(str(send_corr_path))["correction_factor"][:n_bins]
+        else:
+            amp_factors = np.ones(n_bins, dtype=np.float64)
+
+        print(f"  Cal ref           : {cal_path}")
+        print(f"  Method            : {args.method}")
+        print(f"  Path variant      : {recv_path}")
+        print(f"  Config            : {label.upper()}")
+        print(f"  Freq range        : {freq_array[0]:.1f} - {freq_array[-1]:.1f} Hz ({n_bins} bins)")
+        print(f"  Send correction   : {'Yes' if send_corr else 'No'}")
+        print(f"  Recv correction   : {'Yes' if recv_corr else 'No'}")
+        print(f"  Capture duration  : {cfg.noise_calibration_time}s")
+
+        # Generate noise signal (optionally corrected by send factors)
+        if send_corr:
+            # Apply correction envelope to noise (modulate amplitude per-tone-window)
+            tone_dur_s = cfg.tone_duration
+            gap_s_val = cfg.tone_gap
+            hop = int((tone_dur_s + gap_s_val) * fs)
+            corr_env = np.zeros(n_samples_out, dtype=np.float64)
+            for i, amp_f in enumerate(amp_factors):
+                seg_start = i * hop
+                seg_end = min(seg_start + int(tone_dur_s * fs), n_samples_out)
+                corr_env[seg_start:seg_end] += amp_f
+            corr_env = np.maximum(corr_env, 1e-6)
+            base_noise = generate_noise_signal(args.method, n_samples_out, fs, cfg.tone_amplitude, cfg.send_gain)
+            noise_sig = base_noise * corr_env / max(np.max(corr_env), 1e-6)
+        else:
+            noise_sig = generate_noise_signal(args.method, n_samples_out, fs, cfg.tone_amplitude, cfg.send_gain)
+
+        # Stream via callbacks
+        capture_data = np.empty(n_samples_out, dtype="float32")
+        in_offset = [0]
+        out_sent = [0]
+
+        def _out_cb(outdata, frame_count, time_flag, status):
+            if status:
+                print(f"    [Output status: {status}]", flush=True)
+            start = out_sent[0]
+            end = min(start + frame_count, n_samples_out)
+            n = min(frame_count, end - start)
+            buf = noise_sig[start:end].astype(np.float64) * (cfg.send_gain / 100.0)
+            if outdata.ndim == 1:
+                outdata[:n] = buf[:n]
+            else:
+                outdata[:n, 0] = buf[:n]
+            if end < n_samples_out:
+                outdata[n:] = 0.0
+                out_sent[0] = end
+                return (outdata, "continue")
+            outdata[n:] = 0.0
+            return outdata
+
+        def _in_cb(indata, frame_count, time_flag, status):
+            if status:
+                print(f"    [Input status: {status}]", flush=True)
+            n = min(frame_count, len(capture_data) - in_offset[0])
+            capture_data[in_offset[0]:in_offset[0] + n] = indata.flatten()[:n].astype(np.float32)
+            in_offset[0] += n
+
+        out_stream = sd.OutputStream(device=cfg.send_device, samplerate=fs, channels=1, callback=_out_cb, blocksize=512, latency="low")
+        in_stream = sd.InputStream(device=cfg.recv_device, samplerate=fs, channels=1, callback=_in_cb, blocksize=512, latency="low")
+        out_stream.start()
+        in_stream.start()
+
+        elapsed = 0
+        while in_offset[0] < n_samples_out and elapsed < cfg.noise_calibration_time * 3:
+            sd.sleep(100)
+            elapsed += 0.1
+        pct = min(in_offset[0] / n_samples_out * 100, 100)
+        print(f"\r  Capturing [{'#' * int(pct // 2):-50s}] {pct:5.1f}% ({elapsed:.0f}/{cfg.noise_calibration_time:.0f}s)\n", end="", flush=True)
+
+        out_stream.stop()
+        in_stream.stop()
+        out_stream.close()
+        in_stream.close()
+        rec = capture_data[:in_offset[0]].astype(float)
+        print("  Capture complete.")
+
+        # Noise shape analysis
+        shape_result = compare_noise_spectral_shape(rec, args.method, freq_array, fs)
+        print_noise_shape_report(shape_result, args.method)
+
+        if "error" in shape_result:
+            sys.exit(1)
+
+        smoothed_db = smooth_moving_average(shape_result["smoothed_db"], window_size=cfg.smoothing_neighbors)
+
+        # Correction derivation (consistent with calibrate_recv pattern)
+        if args.method in ("pink", "brown"):
+            measured_to_expected = 10 ** (shape_result["smoothed_db"] / 20.0) / max(10 ** (shape_result["expected_shifted_db"] / 20.0), 1e-6)
+            corr_factors_for_npz = np.where(measured_to_expected > 1e-6, 1.0 / measured_to_expected, np.ones_like(measured_to_expected))
+        else:
+            valid_sm = ~np.isnan(shape_result["smoothed_db"])
+            mean_linear = float(np.mean(10 ** (shape_result["smoothed_db"][valid_sm] / 20.0)))
+            corr_factors_for_npz = np.where(smoothed_db > 1e-6, mean_linear / np.maximum(10 ** (smoothed_db / 20.0), 1e-30), np.ones_like(smoothed_db))
+
+        # Apply receive corrections post-capture (same as tone mode)
+        measured_for_chart = shape_result["smoothed_db"].copy()
+        recv_corr_applied = False
+        if recv_corr_factors is not None:
+            H_lin_post = 10 ** (measured_for_chart / 20.0)
+            measured_for_chart = 20 * np.log10(H_lin_post * recv_corr_factors)
+            recv_corr_applied = True
+
+        # Noise chart (shifted reference + percent deviation for pink/brown)
+        png_bytes, corr_factors_npz, _ = build_noise_chart_png(
+            freqs=freq_array,
+            H_db=shape_result["measured_db"],
+            smoothed_db=smoothed_db,
+            expected_db=shape_result.get("expected_shifted_db", shape_result["expected_db"]),
+            deviation_db=shape_result.get("deviation_pct", shape_result["deviation_db"]),
+            corr_factors=corr_factors_for_npz,
+            num_neighbors=cfg.smoothing_neighbors,
+            title=f"Receive Validation ({label.upper()}) -- Noise {args.method.capitalize()}",
+        )
+
+        # Save outputs
+        label_suffix = f"{recv_path}_{label}"
+        wav_path = output_dir / f"validate_recv_noise_{label_suffix}_captured.wav"
+        wavfile.write(str(wav_path), fs, rec.astype(np.float32))
+        chart_path = output_dir / f"validate_recv_noise_{label_suffix}_chart.png"
+        chart_path.write_bytes(png_bytes)
+        np.savez(
+            str(output_dir / f"validate_recv_noise_{label_suffix}_profile.npz"),
+            frequencies=freq_array,
+            response_H=shape_result["measured_db"],
+            correction_factor=corr_factors_npz,
+            smoothed_response_db=smoothed_db,
+            expected_db=shape_result.get("expected_shifted_db", shape_result["expected_db"]),
+            deviation_db=shape_result.get("deviation_pct", shape_result["deviation_db"]),
+            shift_db=np.array([shape_result.get("shift_db", np.nan)]),
+            shape_std_pct=shape_result.get("shape_std_pct", np.nan),
+            global_offset_db=np.array([shape_result.get("global_offset_db", np.nan)]),
+        )
+        print(f"\nWAV saved    : {wav_path}")
+        print(f"Chart saved  : {chart_path}")
+        print(f"Profile NPZ  : {output_dir / f'validate_recv_noise_{label_suffix}_profile.npz'}")
+
+        # Also build tone-style validate chart for comparison
+        valid_mask = ~np.isnan(measured_for_chart)
+        mean_db_n = float(np.mean(measured_for_chart[valid_mask]))
+        lin_n = 10 ** (measured_for_chart[valid_mask] / 20.0)
+        arith_mean_lin = float(np.mean(lin_n))
+        pct_dev_n = np.abs((lin_n - arith_mean_lin) / max(arith_mean_lin, 1e-30) * 100.0)
+        chart_png = build_validate_chart_png(
+            freqs=freq_array[valid_mask],
+            deviation_db=measured_for_chart[valid_mask] - mean_db_n,
+            pct_dev=pct_dev_n,
+            title=f"Receive Validation ({label.upper()}) -- Noise {args.method.capitalize()} -- dB Deviation",
+        )
+        chart_path2 = output_dir / f"validate_recv_noise_{label_suffix}_dev.png"
+        chart_path2.write_bytes(chart_png)
+
+        return shape_result
+
+    # ------------------------------------------------------------------
+    # Tone-based path (existing behavior — sweep/white)
+    # ------------------------------------------------------------------
     # Determine which profile to load for --correct-recv
     profile_for_recv_corr = None
     if args.cal_file and recv_corr:
@@ -197,8 +415,6 @@ def main():
     data = np.load(cal_path, allow_pickle=True)
     freqs_cal = data["frequencies"]     # target frequencies from calibration
     H_db_raw = data["response_H"]       # measured dBFS at each target
-    fs = int(cfg.fs)
-
     n_bins = len(freqs_cal)
 
     # Tone params
@@ -206,6 +422,7 @@ def main():
     gap_s = float(args.gap) if args.gap is not None else float(cfg.tone_gap)
 
     print(f"Receive profile     : {cal_path}")
+    print(f"  Method            : {args.method}")
     print(f"  Path variant      : {recv_path}")
     print(f"  Config            : {label} (send-correct={send_corr}, recv-correct={recv_corr})")
     print(f"  Bins              : {n_bins}")
@@ -256,9 +473,6 @@ def main():
             recv_corr_applied = True
 
     # Save WAV
-    output_dir = Path(args.output_dir) if args.output_dir else _REPO_ROOT / "logs"
-    output_dir.mkdir(exist_ok=True)
-
     label_suffix = f"{recv_path}_{label}"
     wav_path = output_dir / f"validate_recv_{label_suffix}_captured.wav"
     wavfile.write(str(wav_path), fs, rec.astype(np.float32))

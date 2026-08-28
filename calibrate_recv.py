@@ -38,7 +38,7 @@ _REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 from config import config as cfg  # noqa: E402
-from utils.audio.analysis_utils import fft_db, analyze_noise_response, smooth_moving_average
+from utils.audio.analysis_utils import fft_db, analyze_noise_response, smooth_moving_average, compare_noise_spectral_shape, print_noise_shape_report
 from utils.audio.signal_utils import generate_noise_signal, play_one_freq_single, play_one_freq_seq, print_freq_table
 from utils.charting_utils import build_multichart_png
 from utils.file_utils import save_cal_profile, load_send_corrections
@@ -312,6 +312,10 @@ def main():
         for fv, av, rv in zip(freqs_out, amp_db_arr, rms_arr):
             results.append((fv, av, rv))
 
+        # Noise spectral shape analysis (pink/white/brown — reporting only)
+        shape_result = compare_noise_spectral_shape(rec_flat, method, freq_array, fs)
+        print_noise_shape_report(shape_result, method)
+
         # Save single combined WAV capture
         wave_path = output_dir / f"cal_recv_{recv_path}_{variant}_captured.wav"
         wavfile.write(str(wave_path), fs, rec_flat.astype(np.float32))
@@ -477,45 +481,91 @@ def main():
         H_db_input = valid_amps if valid_results else amp_array
         smoothed_db = smooth_moving_average(H_db_input, window_size=cfg.smoothing_neighbors)
 
-        # Correction factor in linear space: correction = mean_linear / smoothed_linear
-        mean_db_val = float(np.mean(H_db_input))
-        mean_linear = 10 ** (mean_db_val / 20.0)
-        smoothed_linear = 10 ** (smoothed_db / 20.0)
-        corr_factors = mean_linear / smoothed_linear
+        # Method-gated: pink/brown uses theoretical-reference; sweep/white uses arithmetic mean
+        png_bytes = None
+        correction_npz_path = None
+        corr_factors = None
+        if method in ("pink", "brown"):
+            # Generate expected profile for this noise method
+            f_ref = freq_array[0]
+            expected_db = np.zeros_like(freq_array)
+            if method == "pink":
+                mask = freq_array > 0
+                expected_db[mask] = -3.0103 * np.log10(freq_array[mask] / f_ref)
+            else:  # brown
+                mask = freq_array > 0
+                expected_db[mask] = -6.0206 * np.log10(freq_array[mask] / f_ref)
 
-        # Build multi-chart (3 panels: response + smoothed trend / deviation sigma / correction factor)
-        png_bytes, _, _ = build_multichart_png(
-            freqs=freq_array,
-            H_db=H_db_input,
-            num_neighbors=cfg.smoothing_neighbors,
-            title=f"Receive DI Response ({recv_path}) Calibration {'(send-corrected)' if args.correct_send else '(uniform tone)'}",
-        )
+            # Least-squares shift of theoretical reference to match measurement level
+            valid_for_shift = ~np.isnan(smoothed_db) & (freq_array > 0)
+            diff_all = smoothed_db[valid_for_shift] - expected_db[valid_for_shift]
+            shift_db = float(np.mean(diff_all))
+            expected_shifted_db = expected_db + shift_db
 
-        # Save profile NPZ (directly in output_dir)
-        npz_path = save_cal_profile(
-            output_dir, f"cal_recv_{recv_path}_{variant}", metadata,
-            response_H=valid_amps if valid_results else amp_array,
-            freqs=freq_array,
-            correction_filter=None,  # corrected via saved per-bin factors instead
-        )
-        print(f"  Profile saved: {npz_path}")
+            # Deviation from shifted theory as percent difference (consistent with sweep/white)
+            shifted_lin = 10 ** (expected_shifted_db / 20.0)
+            measured_lin = 10 ** (smoothed_db / 20.0)
+            deviation_pct = np.abs((measured_lin - shifted_lin) / np.maximum(shifted_lin, 1e-30) * 100.0)
 
-        # Save smoothed data and correction factors to corrections NPZ
-        correction_npz_path = output_dir / f"cal_recv_{recv_path}_{variant}_corrections.npz"
-        np.savez(
-            str(correction_npz_path),
-            freqs=freq_array,
-            response_H_linear=np.maximum(valid_amps if valid_results else amp_array, -200),
-            smoothed_H_db=smoothed_db,
-            correction_factor=corr_factors,
-            mean_H_linear=np.array([mean_linear]),
-        )
-        print(f"  Correction factors saved : {correction_npz_path}")
+            # Correction: linear inverse of (measured / shifted_theory), preserves expected slope
+            measured_to_expected = measured_lin / np.maximum(shifted_lin, 1e-6)
+            corr_factors = np.where(measured_to_expected > 1e-6, 1.0 / measured_to_expected, np.ones_like(measured_to_expected))
 
-        # Save multi-chart PNG alongside profile
-        chart_path = output_dir / f"cal_recv_{recv_path}_{variant}_chart.png"
-        chart_path.write_bytes(png_bytes)
-        print(f"  Chart saved            : {chart_path}")
+            # Deviation in dB for backward compat
+            deviation_db = smoothed_db - expected_shifted_db
+
+            # Build pink/brown-specific chart (3 panels: response+theory / deviation / correction)
+            from utils.charting_utils import build_noise_chart_png as _build_noise_chart
+            png_bytes, _, _ = _build_noise_chart(
+                freqs=freq_array,
+                H_db=H_db_input,
+                smoothed_db=smoothed_db,
+                expected_db=expected_shifted_db,  # shifted reference for charting
+                deviation_db=deviation_pct,        # percent deviation for charting
+                corr_factors=corr_factors,
+                num_neighbors=cfg.smoothing_neighbors,
+                title="Receive DI Response ({}) Calibration - {} Noise".format(recv_path, method.capitalize()),
+            )
+        else:
+            # sweep / white — mean-based correction and standard chart
+            mean_db_val = float(np.mean(H_db_input))
+            mean_linear = 10 ** (mean_db_val / 20.0)
+            smoothed_linear = 10 ** (smoothed_db / 20.0)
+            corr_factors = mean_linear / smoothed_linear
+
+            png_bytes, _, _ = build_multichart_png(
+                freqs=freq_array,
+                H_db=H_db_input,
+                num_neighbors=cfg.smoothing_neighbors,
+                title=f"Receive DI Response ({recv_path}) Calibration {'(send-corrected)' if args.correct_send else '(uniform tone)'}",
+            )
+
+        if png_bytes is not None:
+            # Save profile NPZ (directly in output_dir)
+            npz_path = save_cal_profile(
+                output_dir, f"cal_recv_{recv_path}_{variant}", metadata,
+                response_H=valid_amps if valid_results else amp_array,
+                freqs=freq_array,
+                correction_filter=None,  # corrected via saved per-bin factors instead
+            )
+            print(f"  Profile saved: {npz_path}")
+
+            # Save smoothed data and correction factors to corrections NPZ
+            correction_npz_path = output_dir / f"cal_recv_{recv_path}_{variant}_corrections.npz"
+            np.savez(
+                str(correction_npz_path),
+                freqs=freq_array,
+                response_H_linear=np.maximum(valid_amps if valid_results else amp_array, -200),
+                smoothed_H_db=smoothed_db,
+                correction_factor=corr_factors,
+                mean_H_linear=np.array([float(np.mean(corr_factors))]),
+            )
+            print(f"  Correction factors saved : {correction_npz_path}")
+
+            # Save multi-chart PNG alongside profile
+            chart_path = output_dir / f"cal_recv_{recv_path}_{variant}_chart.png"
+            chart_path.write_bytes(png_bytes)
+            print(f"  Chart saved            : {chart_path}")
 
     print("\n[Done]")
 
