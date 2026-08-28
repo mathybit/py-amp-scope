@@ -1,6 +1,7 @@
 __pycache__/
 .claude/
 CLAUDE.md
+data/*
 logs/
 
 
