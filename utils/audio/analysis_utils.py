@@ -1,5 +1,14 @@
 import math
 import numpy as np
+from pathlib import Path
+import sys
+
+
+# Add repo root to path so we can import config directly
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_REPO_ROOT))
+
+from config import log_f
 
 
 def smooth_moving_average(arr: np.ndarray, window_size: int) -> np.ndarray:
@@ -23,13 +32,17 @@ def fft_db(sig, target_hz, fs):
     """
     FFT Analysis helper
 
-    Get dB value at target frequency via FFT.
+    Get dBFS value at target frequency via FFT.
+
+    Normalizes FFT magnitude by 2/N so a full-scale sine wave (A=1.0) reads +0 dBFS,
+    matching the reference used by ``analyze_noise_response``.
     """
     N = len(sig)
-    fft_vals = np.abs(np.fft.rfft(sig.astype(float)))
+    scale = 2.0 / N
+    fft_vals = np.abs(np.fft.rfft(sig.astype(float))) * scale
     freqs = np.fft.rfftfreq(N, d=1.0/fs)
     idx = np.argmin(np.abs(freqs - target_hz))
-    return 20 * np.log10(max(fft_vals[idx], 1e-10))
+    return 20 * log_f(max(fft_vals[idx], 1e-30))
 
 
 def analyze_noise_response(captured_signal, freq_array, fs):
@@ -71,7 +84,7 @@ def analyze_noise_response(captured_signal, freq_array, fs):
             continue
         idx = np.argmin(np.abs(freq_bins_valid - target_freq))
         mag = fft_vals_valid[idx] * scale
-        db_val = 20.0 * math.log10(max(mag, 1e-30))
+        db_val = 20.0 * log_f(max(mag, 1e-30))
 
         # Compute RMS over a window centered on target frequency
         window_len = int(fs * 0.5)  # 0.5s window for RMS measurement
@@ -229,11 +242,11 @@ def compare_noise_spectral_shape(captured_signal, noise_method, freq_array, fs, 
     if noise_method == "pink":
         # -3.0103 dB per octave ~= amplitude |f|^(-0.5) power |f|^(-1)
         mask = freq_array > 0
-        expected_db[mask] = -3.0103 * np.log10(freq_array[mask] / f_ref)
+        expected_db[mask] = -3.0103 * log_f(freq_array[mask] / f_ref)
     elif noise_method == "brown":
         # -6.0206 dB per octave ~= amplitude |f|^(-1.0) power |f|^(-2)
         mask = freq_array > 0
-        expected_db[mask] = -6.0206 * np.log10(freq_array[mask] / f_ref)
+        expected_db[mask] = -6.0206 * log_f(freq_array[mask] / f_ref)
     # white: all zeros (flat)
 
     # Step 4: least-squares shift of theoretical reference to match measured level

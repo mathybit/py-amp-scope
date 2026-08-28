@@ -30,16 +30,16 @@ from scipy.io import wavfile
 _REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_REPO_ROOT))
 
-from config import config as cfg  # noqa: E402
-from utils.audio.analysis_utils import (  # noqa: E402
+from config import log_base, log_f, config as cfg
+from utils.audio.analysis_utils import (
     compare_noise_spectral_shape,
     deviation_report,
     extract_tone_measurements,
     print_noise_shape_report,
     smooth_moving_average,
 )
-from utils.audio.signal_utils import generate_noise_signal, play_one_freq_single  # noqa: E402
-from utils.charting_utils import build_noise_chart_png, build_validate_chart_png  # noqa: E402
+from utils.audio.signal_utils import generate_noise_signal, play_one_freq_single
+from utils.charting_utils import build_noise_chart_png, build_validate_chart_png
 from utils.file_utils import load_send_corrections
 
 
@@ -131,7 +131,7 @@ def main():
         cal_path = Path(args.cal_file) if args.cal_file else _REPO_ROOT / "data" / "cal_send_profile.npz"
         if not cal_path.exists():
             print(f"WARNING: Calibration profile not found at {cal_path}")
-            freq_array = np.logspace(math.log10(cfg.freq_min), math.log10(cfg.freq_max), cfg.num_freqs_default)
+            freq_array = np.logspace(log_f(cfg.freq_min), log_f(cfg.freq_max), cfg.num_freqs_default, base=log_base)
         else:
             data_ref = np.load(cal_path, allow_pickle=True)
             freq_array = data_ref["frequencies"]

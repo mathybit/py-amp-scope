@@ -33,15 +33,16 @@ def build_multichart_png(
 
     # Clamp to valid dB range and compute statistics from unsmoothed data
     H_mag_db = np.maximum(H_db, -200)
+
+    # Smoothing for the correction factor — moving average over nearest neighbors
+    H_smoothed_db = smooth_moving_average(H_mag_db, window_size=num_neighbors)
     mean_db = float(np.mean(H_mag_db))
     std_db = float(np.std(H_mag_db))
 
     # Deviation (sigma) from the charting perspective
-    deviation_db = H_mag_db - mean_db
+    #deviation_db = H_mag_db - mean_db
+    deviation_db = H_smoothed_db - mean_db  # Use the smoothed signal when displaying deviation
     deviation_sigma = deviation_db / max(std_db, 1e-10)
-
-    # Smoothing for the correction factor — moving average over nearest neighbors
-    H_smoothed_db = smooth_moving_average(H_mag_db, window_size=num_neighbors)
 
     # Correction factor in linear space:
     #   correction = H_mean_linear / H_smoothed_linear
@@ -58,8 +59,8 @@ def build_multichart_png(
     # Panel 1: Frequency response (raw + smoothed trend)
     ax = axes[0]
     ax.set_ylabel("Magnitude (dB)")
-    ax.plot(freqs, H_mag_db, "r-", linewidth=1.2, alpha=0.8, label="Measured (raw)")
-    ax.plot(freqs, H_smoothed_db, "g--", linewidth=1.5, alpha=0.7, label="Smoothed trend")
+    ax.plot(freqs, H_mag_db, "r-", linewidth=1.2, alpha=0.7, label="Measured (raw)")
+    ax.plot(freqs, H_smoothed_db, "g--", linewidth=1.5, alpha=0.8, label="Smoothed trend")
     ax.axhline(mean_db, color="gray", linewidth=0.8, linestyle="--", alpha=0.6, label=f"Mean ({mean_db:.1f} dB)")
     ax.grid(True, which="major", axis="x", alpha=0.3)
     y_min = min(H_mag_db.min(), H_smoothed_db.min())

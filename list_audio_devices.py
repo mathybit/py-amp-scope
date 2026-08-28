@@ -36,20 +36,22 @@ except FileNotFoundError:
     pass
 
 TONE_FREQ = _config_defaults.get("tone_freq", 440)
-TONE_DURATION = _config_defaults.get("tone_duration", 2.0)
+TONE_DURATION = _config_defaults.get("device_test_tone_duration", 3.0)
 RECORD_SECONDS = _config_defaults.get("record_seconds", 3.0)
 TEST_TONE_VOL = _config_defaults.get("test_tone_vol", 0.3)
+SEND_GAIN = _config_defaults.get("send_gain", 50)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def generate_tone(freq=TONE_FREQ, duration=TONE_DURATION, fs=None, vol=TEST_TONE_VOL):
+def generate_tone(freq=TONE_FREQ, duration=TONE_DURATION, fs=None, send_gain=SEND_GAIN, vol=TEST_TONE_VOL):
     """Generate a sine wave test tone."""
     if fs is None:
         fs = _config_defaults.get("fs", 44100)
     t = np.arange(int(fs * duration)) / fs
-    return (np.sin(2 * np.pi * freq * t) * vol).astype(np.float32)
+    amplitude = vol * (send_gain / 100.0)
+    return (amplitude * np.sin(2 * np.pi * freq * t)).astype(np.float32)
 
 
 def dev_channel_count(dev, direction):

@@ -1,6 +1,15 @@
 import math
 import numpy as np
+from pathlib import Path
 import sounddevice as sd
+import sys
+
+
+# Add repo root to path so we can import config directly
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_REPO_ROOT))
+
+from config import log_f
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +296,7 @@ def generate_noise_signal(method, n_samples, fs, tone_amplitude, send_gain):
 # ---------------------------------------------------------------------------
 def print_freq_table(freqs, fs, mode, tone_duration=1.0, gap_s=0.3):
     """Print a formatted frequency table."""
-    spacing = "log" if np.all(np.diff(np.log10(freqs)) > 0) else "linear"
+    spacing = "log" if np.all(np.diff(log_f(freqs)) > 0) else "linear"
 
     border = "=" * 52
     title = f"PyAmpScope -- {spacing.capitalize()} Spaced Frequencies ({mode} mode)"

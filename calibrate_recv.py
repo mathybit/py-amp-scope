@@ -37,7 +37,7 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_REPO_ROOT))
 
-from config import config as cfg  # noqa: E402
+from config import log_base, log_f, config as cfg
 from utils.audio.analysis_utils import fft_db, analyze_noise_response, smooth_moving_average, compare_noise_spectral_shape, print_noise_shape_report
 from utils.audio.signal_utils import generate_noise_signal, play_one_freq_single, play_one_freq_seq, print_freq_table
 from utils.charting_utils import build_multichart_png
@@ -187,7 +187,7 @@ def main():
     total_s = num_freqs * (tone_duration + gap_s)
 
     # Generate log-spaced frequency array directly from computed count
-    freq_array = np.logspace(np.log10(freq_min), np.log10(freq_max), num=num_freqs)
+    freq_array = np.logspace(log_f(freq_min), log_f(freq_max), num=num_freqs, base=log_base)
 
     print("=" * 60)
     print(f"PyAmpScope Receive DI Calibration Profile")
@@ -210,9 +210,6 @@ def main():
 
     variant = "corr" if args.correct_send else "base"
 
-    # Print frequency table
-    print_freq_table(freq_array, fs, args.mode, tone_duration=tone_duration, gap_s=gap_s)
-    
     print(f"  Base tone amplitude (unscaled) : {tone_amplitude:.4f}")
     if args.correct_send:
         # Apply send-correction factors
@@ -228,6 +225,8 @@ def main():
         print(f"  Uniform amp values             : {send_corr_factors[0] * tone_amplitude:.4f}")
 
     if args.dry_run:
+        # Print frequency table
+        print_freq_table(freq_array, fs, args.mode, tone_duration=tone_duration, gap_s=gap_s)
         print("\n[Dry run -- skipping hardware play/capture and file writes.]")
         return
 
@@ -491,10 +490,10 @@ def main():
             expected_db = np.zeros_like(freq_array)
             if method == "pink":
                 mask = freq_array > 0
-                expected_db[mask] = -3.0103 * np.log10(freq_array[mask] / f_ref)
+                expected_db[mask] = -3.0103 * log_f(freq_array[mask] / f_ref)
             else:  # brown
                 mask = freq_array > 0
-                expected_db[mask] = -6.0206 * np.log10(freq_array[mask] / f_ref)
+                expected_db[mask] = -6.0206 * log_f(freq_array[mask] / f_ref)
 
             # Least-squares shift of theoretical reference to match measurement level
             valid_for_shift = ~np.isnan(smoothed_db) & (freq_array > 0)

@@ -30,16 +30,16 @@ from scipy.io import wavfile
 _REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_REPO_ROOT))
 
-from config import config as cfg  # noqa: E402
-from utils.audio.analysis_utils import (  # noqa: E402
+from config import log_base, log_f, config as cfg
+from utils.audio.analysis_utils import (
     compare_noise_spectral_shape,
     deviation_report,
     extract_tone_measurements,
     print_noise_shape_report,
     smooth_moving_average,
 )
-from utils.audio.signal_utils import generate_noise_signal, play_one_freq_single  # noqa: E402
-from utils.charting_utils import build_noise_chart_png, build_validate_chart_png  # noqa: E402
+from utils.audio.signal_utils import generate_noise_signal, play_one_freq_single
+from utils.charting_utils import build_noise_chart_png, build_validate_chart_png
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +189,7 @@ def main():
         cal_path = Path(args.cal_file) if args.cal_file else _REPO_ROOT / "data" / f"cal_recv_{recv_path}_corr_profile.npz"
         if not cal_path.exists():
             print(f"WARNING: Calibration profile not found at {cal_path}")
-            freq_array = np.logspace(math.log10(cfg.freq_min), math.log10(cfg.freq_max), cfg.num_freqs_default)
+            freq_array = np.logspace(log_f(cfg.freq_min), log_f(cfg.freq_max), cfg.num_freqs_default, base=log_base)
         else:
             data_ref = np.load(cal_path, allow_pickle=True)
             freq_array = data_ref["frequencies"]
@@ -323,7 +323,7 @@ def main():
         recv_corr_applied = False
         if recv_corr_factors is not None:
             H_lin_post = 10 ** (measured_for_chart / 20.0)
-            measured_for_chart = 20 * np.log10(H_lin_post * recv_corr_factors)
+            measured_for_chart = 20 * log_f(H_lin_post * recv_corr_factors)
             recv_corr_applied = True
 
         # Noise chart (shifted reference + percent deviation for pink/brown)
@@ -460,7 +460,7 @@ def main():
             # Correction factors are linear multipliers; convert dBFS → linear → correct → back to dBFS
             H_lin = 10 ** (measured / 20.0)
             H_corr_lin = H_lin * corr_factors
-            measured = 20 * np.log10(H_corr_lin)
+            measured = 20 * log_f(H_corr_lin)
             recv_corr_applied = True
         else:
             # Fallback: compute on-the-fly from raw profile (H_mean_linear / H_linear)
@@ -469,7 +469,7 @@ def main():
             H_mean_linear = float(np.mean(H_linear))
             corr_factors = np.where(H_linear > 1e-6, H_mean_linear / H_linear, np.ones(n_bins))
             H_lin = 10 ** (measured / 20.0)
-            measured = 20 * np.log10(H_lin * corr_factors)
+            measured = 20 * log_f(H_lin * corr_factors)
             recv_corr_applied = True
 
     # Save WAV
