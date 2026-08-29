@@ -5,10 +5,17 @@ All charts use a log-frequency x-axis and headless matplotlib backend.
 """
 
 import io
-
 import numpy as np
+from pathlib import Path
+import sys
+
+
+# Add repo root to path so we can import config directly
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO_ROOT))
 
 from .audio.analysis_utils import smooth_moving_average
+from config import log_base
 
 
 def build_multichart_png(
@@ -48,7 +55,7 @@ def build_multichart_png(
     #   correction = H_mean_linear / H_smoothed_linear
     # = 10^((H_mean_dB - H_smoothed_dB) / 20)
     h_diff_db = mean_db - H_smoothed_db
-    correction_factor = 10 ** (h_diff_db / 20.0)
+    correction_factor = log_base ** (h_diff_db / 20.0)
 
     dev_ylabel = f"Deviation (sigma={std_db:.2f}dB)"
 
