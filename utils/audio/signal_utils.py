@@ -292,6 +292,41 @@ def generate_noise_signal(method, n_samples, fs, tone_amplitude, send_gain):
 
 
 # ---------------------------------------------------------------------------
+# Sweep sequence generation
+# ---------------------------------------------------------------------------
+
+def generate_sweep_sequence(freq_array, fs, duration_s=30.0, gap_s=0.2, tone_amplitude=1.0):
+    """Generate a sweep signal: each freq is played sequentially with inter-tone gaps.
+
+    Args:
+        freq_array: np.ndarray of frequencies in Hz (each element is one tone).
+        fs: sample rate in Hz.
+        duration_s: duration per tone in seconds.
+        gap_s: gap between tones in seconds.
+        tone_amplitude: amplitude for each sine tone.
+
+    Returns:
+        np.ndarray of float64 samples, concatenated sequence of all tones + gaps.
+    """
+    n_tones = len(freq_array)
+    tone_samples = int(duration_s * fs)
+    gap_samples = int(gap_s * fs)
+    total_len = n_tones * tone_samples + (n_tones - 1) * gap_samples
+    signal = np.zeros(total_len, dtype=np.float64)
+
+    offset = 0
+    for i, freq in enumerate(freq_array):
+        t = np.arange(tone_samples) / fs
+        tone = tone_amplitude * np.sin(2.0 * math.pi * freq * t)
+        signal[offset:offset + tone_samples] = tone.astype(np.float64)
+        offset += tone_samples
+        if i < n_tones - 1:
+            offset += gap_samples
+
+    return signal
+
+
+# ---------------------------------------------------------------------------
 # Frequency table
 # ---------------------------------------------------------------------------
 def print_freq_table(freqs, fs, mode, tone_duration=1.0, gap_s=0.3):

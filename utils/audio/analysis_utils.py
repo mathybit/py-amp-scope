@@ -8,7 +8,7 @@ import sys
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
-from config import log_f
+from config import log_base, log_f
 
 
 def smooth_moving_average(arr: np.ndarray, window_size: int) -> np.ndarray:
@@ -111,6 +111,222 @@ def compute_correction(H_lin):
     tol = 1e-3
     H_mag = np.maximum(np.abs(H_lin), tol)
     return np.conj(H_lin) / H_mag
+
+
+# ==========================================================================
+#  THD + Harmonics analysis (moved from run.py)
+# ==========================================================================
+
+def _find_persistent_peaks(sig, fs, peak_thresh_db=-60.0, min_prominence_hz=50):
+    """Find peaks in a signal's FFT that persist across the full capture."""
+    fft_vals = np.fft.rfft(sig.astype(np.float64))
+    freqs = np.fft.rfftfreq(len(sig), d=1.0 / fs)
+    mag_db = 20 * log_f(np.maximum(np.abs(fft_vals), 1e-30))
+    return freqs, mag_db
+
+
+def compute_thd(signal, fs):
+    """Compute Total Harmonic Distortion (THD) of a signal.
+
+    Finds the fundamental (highest non-DC peak above 20 Hz), then sums power
+    in integer harmonics 2..10. Returns dict with thd_pct, thdn_pct, and harmonic_levels_dB.
+    """
+    freqs, mag_db = _find_persistent_peaks(signal, fs)
+
+    # Find fundamental: highest peak above threshold in [20, 500] Hz
+    fund_candidates = (freqs > 20) & (freqs < 500) & (mag_db > -90)
+    if not np.any(fund_candidates):
+        return {"thd_pct": None, "thdn_pct": None, "harmonic_levels_dB": {}}
+
+    fund_freqs_on_mask = freqs[fund_candidates]
+    fund_mag_on_mask = mag_db[fund_candidates]
+    best_idx = np.argmax(fund_mag_on_mask)
+    fund_freq = float(fund_freqs_on_mask[best_idx])
+    fund_mag_db = float(fund_mag_on_mask[best_idx])
+
+    thd_numer = 0.0
+    thdn_numer = 0.0
+    harmonics_dB = {}
+
+    for h in range(2, 11):
+        h_freq = fund_freq * h
+        if h_freq > fs / 2.0:
+            break
+        # Find nearest FFT bin
+        idx = int(np.argmin(np.abs(freqs - h_freq)))
+        h_mag_db = float(mag_db[idx])
+        harmonics_dB["%dth" % h] = h_mag_db
+        h_lin = 10 ** ((h_mag_db - fund_mag_db) / 20.0)
+        thd_numer += h_lin ** 2
+        if h <= 5:
+            thdn_numer += h_lin ** 2
+
+    thd_pct = float(math.sqrt(thd_numer)) * 100.0
+    # THD+N: fundamental + harmonics total relative to noise floor
+    noise_floor_idx = (freqs > fund_freq * 20) & (freqs < fs / 3.0)
+    if np.any(noise_floor_idx):
+        noise_rms = float(np.sqrt(np.mean(10 ** ((mag_db[noise_floor_idx] - fund_mag_db) / 10.0))))
+        thdn_pct = math.sqrt(thd_numer + noise_rms ** 2) * 100.0
+    else:
+        thdn_pct = thd_pct
+
+    return {
+        "fundamental_freq_hz": round(fund_freq, 1),
+        "fundamental_mag_dB": round(fund_mag_db, 2),
+        "thd_pct": round(thd_pct, 3),
+        "thdn_pct": round(thdn_pct, 3),
+        "harmonic_levels_dB": {k: round(v, 2) for k, v in harmonics_dB.items()},
+    }
+
+
+def compute_thd_per_tone_with_freqs(signal, fs, freq_array, params=None):
+    """Compute per-tone THD for each frequency in *freq_array*, extracting from *signal*.
+
+    Returns:
+        (freqs_out, thd_values, fund_mags) where all three are np.ndarray of equal length.
+        Only tones that produced a valid measurement are returned.
+    """
+    tone_dur = params.get("tone_duration", 0.7) if params else 0.7
+    gap_s = params.get("gap_s", 0.2) if params else 0.2
+    hop = int((tone_dur + gap_s) * fs)
+
+    freqs_out = []
+    thd_values = []
+    fund_mags = []
+
+    for i, target_freq in enumerate(freq_array):
+        seg_start = i * hop
+        seg_end = min(seg_start + int(tone_dur * fs), len(signal))
+        seg = signal[seg_start:seg_end]
+        if len(seg) < 128:
+            continue
+
+        # FFT of this tone segment
+        n = len(seg)
+        fft_vals = np.abs(np.fft.rfft(seg.astype(np.float64))) * (2.0 / n)
+        fft_freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+        mag_db = 20.0 * log_f(np.maximum(fft_vals, 1e-30))
+
+        # Find fundamental: peak near target_freq
+        fund_mask = (fft_freqs >= target_freq * 0.9) & (fft_freqs <= target_freq * 1.1)
+        if not np.any(fund_mask):
+            continue
+        local_idx = int(np.argmax(mag_db[fund_mask]))
+        global_idx = np.where(fund_mask)[0][local_idx]
+        fund_mag_db = float(mag_db[global_idx])
+
+        # Measure harmonics at 2x, 3x...10x fundamental within this segment's FFT range
+        thd_sum_sq = 0.0
+        for h in range(2, 11):
+            h_freq = target_freq * h
+            if h_freq > fs / 2.0:
+                break
+            idx = int(np.argmin(np.abs(fft_freqs - h_freq)))
+            h_mag_db = float(mag_db[idx])
+            # THD contribution: (harmonic_amp / fundamental_amp)^2 in linear domain
+            thd_sum_sq += (10 ** ((h_mag_db - fund_mag_db) / 20.0)) ** 2
+
+        thd_pct = float(math.sqrt(thd_sum_sq)) * 100.0
+
+        freqs_out.append(target_freq)
+        thd_values.append(thd_pct)
+        fund_mags.append(fund_mag_db)
+
+    return (np.array(freqs_out), np.array(thd_values), np.array(fund_mags))
+
+
+def compute_harmonics_for_overdrive(signal, fs, fundamental_hz=None):
+    """Find prominent harmonics above a threshold (for overdrive analysis).
+
+    If fundamental is not given, finds it automatically as the strongest peak above 20 Hz.
+    Returns list of dicts with freq, level_dB, order keys.
+    """
+    freqs, mag_db = _find_persistent_peaks(signal, fs)
+
+    if fundamental_hz is None:
+        candidates = (freqs > 20) & (mag_db > -90)
+        if not np.any(candidates):
+            return []
+        fund_idx = np.argmax(mag_db[candidates])
+        fundamental_hz = float(freqs[candidates][fund_idx])
+
+    # Find peaks near integer harmonics of the fundamental
+    fundamentals_lin = 10 ** (mag_db[np.argmin(np.abs(freqs - fundamental_hz))] / 20.0)
+
+    result = []
+    for h in range(2, min(16, int((fs / 2.0) / fundamental_hz))):
+        h_freq = fundamental_hz * h
+        if h_freq > fs / 2.0:
+            break
+        idx = np.argmin(np.abs(freqs - h_freq))
+        if mag_db[idx] > -90:
+            h_lin = 10 ** (mag_db[idx] / 20.0) / fundamentals_lin
+            result.append({
+                "order": h,
+                "freq_hz": round(h_freq, 1),
+                "level_dB_relative_to_fund": round(20 * log_f(max(abs(h_lin), 1e-30)), 2),
+                "level_linear": round(abs(h_lin), 6),
+            })
+
+    return result
+
+
+def compute_odd_even_ratio(signal, fs):
+    """Compute the ratio of odd-order to even-order harmonic power."""
+    freqs, mag_db = _find_persistent_peaks(signal, fs)
+    candidates = (freqs > 20) & (mag_db > -90)
+    if not np.any(candidates):
+        return None
+
+    fund_idx = np.argmax(mag_db[candidates])
+    fund_freq = float(freqs[candidates][fund_idx])
+
+    odd_power = 0.0
+    even_power = 0.0
+    for h in range(2, min(16, int((fs / 2.0) / fund_freq))):
+        h_freq = fund_freq * h
+        idx = np.argmin(np.abs(freqs - h_freq))
+        if mag_db[idx] > -90:
+            h_lin = 10 ** (mag_db[idx] / 20.0)
+            if h % 2 == 1:
+                odd_power += h_lin ** 2
+            else:
+                even_power += h_lin ** 2
+
+    if even_power < 1e-30:
+        return {"odd_even_ratio": None, "odd_power_dB": round(10 * log_f(max(odd_power, 1e-30)), 2),
+                "even_power_dB": -99.0}
+    return {
+        "odd_even_ratio": round(math.sqrt(odd_power / max(even_power, 1e-30)), 4),
+        "odd_power_dB": round(10 * log_f(max(odd_power, 1e-30)), 2),
+        "even_power_dB": round(10 * log_f(max(even_power, 1e-30)), 2),
+    }
+
+
+def compute_octave_band_stats(signal, freq_array, fs):
+    """Compute per-octave-band mean and std of measured dB."""
+    fft_vals = np.abs(np.fft.rfft(signal.astype(np.float64))) / (len(signal) // 2)
+    fft_freqs = np.fft.rfftfreq(len(signal), d=1.0 / fs)
+    scale = 2.0 / len(signal)
+    mag_db = 20 * log_f(np.maximum(fft_vals * scale, 1e-30))
+
+    octaves = [(20, 100, "Sub-bass"), (100, 300, "Bass"), (300, 800, "Low-mid"),
+               (800, 2000, "Mid"), (2000, 5000, "Upper-mid"), (5000, 10000, "Presence"),
+               (10000, 20000, "Brilliance")]
+
+    bands = {}
+    for lo, hi, name in octaves:
+        mask = (fft_freqs >= lo) & (fft_freqs < hi) & (~np.isnan(mag_db)) & (fft_freqs > 0)
+        if np.sum(mask) > 2:
+            vals = mag_db[mask]
+            bands[name] = {
+                "mean_dB": round(float(np.mean(vals)), 2),
+                "std_dB": round(float(np.std(vals)), 2),
+                "min_dB": round(float(np.min(vals)), 2),
+                "max_dB": round(float(np.max(vals)), 2),
+                "bins": int(np.sum(mask)),
+            }
+    return bands
 
 
 def extract_tone_measurements(rec, freqs, tone_duration_s, gap_s, fs):

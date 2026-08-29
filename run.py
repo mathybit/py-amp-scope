@@ -33,8 +33,10 @@ _REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 from config import log_f, config as _cfg_module
-from utils.audio.signal_utils import generate_noise_signal
-from utils.audio.analysis_utils import analyze_noise_response, compare_noise_spectral_shape, smooth_moving_average, extract_tone_measurements
+from utils.audio.signal_utils import generate_noise_signal, generate_sweep_sequence
+from utils.audio.analysis_utils import (analyze_noise_response, compare_noise_spectral_shape,
+    smooth_moving_average, extract_tone_measurements, compute_thd, compute_thd_per_tone_with_freqs,
+    compute_harmonics_for_overdrive, compute_odd_even_ratio, compute_octave_band_stats)
 
 
 class _Config:
@@ -61,198 +63,6 @@ class _Config:
     logs_dir = property(lambda self: getattr(_cfg_module, "logs_dir", "logs"))
 
 config = _Config()
-
-
-def generate_sweep_sequence(freq_array, fs, duration_s=30.0, gap_s=0.2, tone_amplitude=1.0):
-    """Generate a sweep signal: each freq is played sequentially with inter-tone gaps.
-
-    Args:
-        freq_array: np.ndarray of frequencies in Hz (each element is one tone).
-        fs: sample rate in Hz.
-        duration_s: duration per tone in seconds.
-        gap_s: gap between tones in seconds.
-        tone_amplitude: amplitude for each sine tone.
-
-    Returns:
-        np.ndarray of float64 samples, concatenated sequence of all tones + gaps.
-    """
-    n_tones = len(freq_array)
-    # Calculate total length
-    tone_samples = int(duration_s * fs)
-    gap_samples = int(gap_s * fs)
-    total_len = n_tones * tone_samples + (n_tones - 1) * gap_samples
-    signal = np.zeros(total_len, dtype=np.float64)
-
-    offset = 0
-    for i, freq in enumerate(freq_array):
-        t = np.arange(tone_samples) / fs
-        tone = tone_amplitude * np.sin(2.0 * math.pi * freq * t)
-        signal[offset:offset + tone_samples] = tone.astype(np.float64)
-        offset += tone_samples
-        if i < n_tones - 1:
-            offset += gap_samples  # gap of zeros
-
-    return signal
-
-
-# ==========================================================================
-#  Signal analysis helpers (new: THD + harmonics)
-# ==========================================================================
-
-def _find_persistent_peaks(sig, fs, peak_thresh_db=-60.0, min_prominence_hz=50):
-    """Find peaks in a signal's FFT that persist across the full capture."""
-    fft_vals = np.fft.rfft(sig.astype(np.float64))
-    freqs = np.fft.rfftfreq(len(sig), d=1.0 / fs)
-    mag_db = 20 * log_f(np.maximum(np.abs(fft_vals), 1e-30))
-    return freqs, mag_db
-
-
-def compute_thd(signal, fs):
-    """Compute Total Harmonic Distortion (THD) of a signal.
-
-    Finds the fundamental (highest non-DC peak above 20 Hz), then sums power
-    in integer harmonics 2..10. Returns dict with thd_pct, thdn_pct, and harmonic_levels_dB.
-    """
-    freqs, mag_db = _find_persistent_peaks(signal, fs)
-
-    # Find fundamental: highest peak above threshold in [20, 500] Hz
-    fund_candidates = (freqs > 20) & (freqs < 500) & (mag_db > -90)
-    if not np.any(fund_candidates):
-        return {"thd_pct": None, "thdn_pct": None, "harmonic_levels_dB": {}}
-
-    fund_freqs_on_mask = freqs[fund_candidates]
-    fund_mag_on_mask = mag_db[fund_candidates]
-    best_idx = np.argmax(fund_mag_on_mask)
-    fund_freq = float(fund_freqs_on_mask[best_idx])
-    fund_mag_db = float(fund_mag_on_mask[best_idx])
-
-    thd_numer = 0.0
-    thdn_numer = 0.0
-    harmonics_dB = {}
-
-    for h in range(2, 11):
-        h_freq = fund_freq * h
-        if h_freq > fs / 2.0:
-            break
-        # Find nearest FFT bin
-        idx = int(np.argmin(np.abs(freqs - h_freq)))
-        h_mag_db = float(mag_db[idx])
-        harmonics_dB["%dth" % h] = h_mag_db
-        h_lin = 10 ** ((h_mag_db - fund_mag_db) / 20.0)
-        thd_numer += h_lin ** 2
-        if h <= 5:
-            thdn_numer += h_lin ** 2
-
-    thd_pct = float(math.sqrt(thd_numer)) * 100.0
-    # THD+N: fundamental + harmonics total relative to noise floor
-    noise_floor_idx = (freqs > fund_freq * 20) & (freqs < fs / 3.0)
-    if np.any(noise_floor_idx):
-        noise_rms = float(np.sqrt(np.mean(10 ** ((mag_db[noise_floor_idx] - fund_mag_db) / 10.0))))
-        thdn_pct = math.sqrt(thd_numer + noise_rms ** 2) * 100.0
-    else:
-        thdn_pct = thd_pct
-
-    return {
-        "fundamental_freq_hz": round(fund_freq, 1),
-        "fundamental_mag_dB": round(fund_mag_db, 2),
-        "thd_pct": round(thd_pct, 3),
-        "thdn_pct": round(thdn_pct, 3),
-        "harmonic_levels_dB": {k: round(v, 2) for k, v in harmonics_dB.items()},
-    }
-
-
-def compute_harmonics_for_overdrive(signal, fs, fundamental_hz=None):
-    """Find prominent harmonics above a threshold (for overdrive analysis).
-
-    If fundamental is not given, finds it automatically as the strongest peak above 20 Hz.
-    Returns list of dicts with freq, level_dB, order keys.
-    """
-    freqs, mag_db = _find_persistent_peaks(signal, fs)
-
-    if fundamental_hz is None:
-        candidates = (freqs > 20) & (mag_db > -90)
-        if not np.any(candidates):
-            return []
-        fund_idx = np.argmax(mag_db[candidates])
-        fundamental_hz = float(freqs[candidates][fund_idx])
-
-    # Find peaks near integer harmonics of the fundamental
-    fundamentals_lin = 10 ** (mag_db[np.argmin(np.abs(freqs - fundamental_hz))] / 20.0)
-
-    result = []
-    for h in range(2, min(16, int((fs / 2.0) / fundamental_hz))):
-        h_freq = fundamental_hz * h
-        if h_freq > fs / 2.0:
-            break
-        idx = np.argmin(np.abs(freqs - h_freq))
-        if mag_db[idx] > -90:
-            h_lin = 10 ** (mag_db[idx] / 20.0) / fundamentals_lin
-            result.append({
-                "order": h,
-                "freq_hz": round(h_freq, 1),
-                "level_dB_relative_to_fund": round(20 * log_f(max(abs(h_lin), 1e-30)), 2),
-                "level_linear": round(abs(h_lin), 6),
-            })
-
-    return result
-
-
-def compute_odd_even_ratio(signal, fs):
-    """Compute the ratio of odd-order to even-order harmonic power."""
-    freqs, mag_db = _find_persistent_peaks(signal, fs)
-    candidates = (freqs > 20) & (mag_db > -90)
-    if not np.any(candidates):
-        return None
-
-    fund_idx = np.argmax(mag_db[candidates])
-    fund_freq = float(freqs[candidates][fund_idx])
-
-    odd_power = 0.0
-    even_power = 0.0
-    for h in range(2, min(16, int((fs / 2.0) / fund_freq))):
-        h_freq = fund_freq * h
-        idx = np.argmin(np.abs(freqs - h_freq))
-        if mag_db[idx] > -90:
-            h_lin = 10 ** (mag_db[idx] / 20.0)
-            if h % 2 == 1:
-                odd_power += h_lin ** 2
-            else:
-                even_power += h_lin ** 2
-
-    if even_power < 1e-30:
-        return {"odd_even_ratio": None, "odd_power_dB": round(10 * log_f(max(odd_power, 1e-30)), 2),
-                "even_power_dB": -99.0}
-    return {
-        "odd_even_ratio": round(math.sqrt(odd_power / max(even_power, 1e-30)), 4),
-        "odd_power_dB": round(10 * log_f(max(odd_power, 1e-30)), 2),
-        "even_power_dB": round(10 * log_f(max(even_power, 1e-30)), 2),
-    }
-
-
-def compute_octave_band_stats(signal, freq_array, fs):
-    """Compute per-octave-band mean and std of measured dB."""
-    fft_vals = np.abs(np.fft.rfft(signal.astype(np.float64))) / (len(signal) // 2)
-    fft_freqs = np.fft.rfftfreq(len(signal), d=1.0 / fs)
-    scale = 2.0 / len(signal)
-    mag_db = 20 * log_f(np.maximum(fft_vals * scale, 1e-30))
-
-    octaves = [(20, 100, "Sub-bass"), (100, 300, "Bass"), (300, 800, "Low-mid"),
-               (800, 2000, "Mid"), (2000, 5000, "Upper-mid"), (5000, 10000, "Presence"),
-               (10000, 20000, "Brilliance")]
-
-    bands = {}
-    for lo, hi, name in octaves:
-        mask = (fft_freqs >= lo) & (fft_freqs < hi) & (~np.isnan(mag_db)) & (fft_freqs > 0)
-        if np.sum(mask) > 2:
-            vals = mag_db[mask]
-            bands[name] = {
-                "mean_dB": round(float(np.mean(vals)), 2),
-                "std_dB": round(float(np.std(vals)), 2),
-                "min_dB": round(float(np.min(vals)), 2),
-                "max_dB": round(float(np.max(vals)), 2),
-                "bins": int(np.sum(mask)),
-            }
-    return bands
 
 
 # ==========================================================================
@@ -628,6 +438,35 @@ class AnalyzerWorker(threading.Thread):
         octave_stats = compute_octave_band_stats(seg, freq_array if len(freq_array) > 0 else np.array([40]), fs)
         metrics["octave_bands"] = octave_stats
 
+        # Overall RMS/Peak (all modes — live only for noise; sweep uses _compute_final_metrics at end)
+        if len(seg) > 0:
+            metrics["rms_signal"] = round(float(np.sqrt(np.mean(seg.astype(float) ** 2))), 6)
+            metrics["peak_dBFS"] = round(float(20 * log_f(max(np.max(np.abs(seg)), 1e-30))), 2)
+
+        # Per-band RMS (noise): spectral density (RMS/Hz) per band, independent of bin count.
+        # FFT zero-out + IFFT extracts the band's signal component; divide bins by sqrt(N_B)
+        # to normalize out the number-of-bins bias so white noise shows equal values per band.
+        fft_full = np.fft.rfft(seg.astype(np.float64))
+        fft_freqs = np.fft.rfftfreq(len(seg), d=1.0 / fs)
+        n = len(seg)
+        rms_per_band = {}
+        for lo, hi, name in [(20, 100, "Sub-bass"), (100, 300, "Bass"), (300, 800, "Low-mid"),
+                              (800, 2000, "Mid"), (2000, 5000, "Upper-mid"), (5000, 10000, "Presence"),
+                              (10000, 20000, "Brilliance")]:
+            band_mask = (fft_freqs >= lo) & (fft_freqs < hi)
+            if np.sum(band_mask) > 2:
+                fft_band = fft_full.copy()
+                fft_band[~band_mask] = 0
+                N_B = np.sum(band_mask)
+                band_signal = np.real(np.fft.irfft(fft_band / np.sqrt(N_B), n=n))
+                band_rms = float(np.sqrt(np.mean(band_signal ** 2)))
+                rms_per_band[name] = {
+                    "mean": round(band_rms, 6),
+                    "max": round(float(np.max(np.abs(band_signal))), 6),
+                    "tones": int(N_B),
+                }
+            metrics["rms_per_band"] = rms_per_band
+
         return metrics
 
     def _compute_final_metrics(self, final_seg, freq_array, fs, noise_method):
@@ -646,18 +485,18 @@ class AnalyzerWorker(threading.Thread):
             "max_dBFS": round(float(np.max(db_valid)), 2),
         }
 
-        # THD analysis
-        thd = compute_thd(final_seg, fs)
-        metrics["thd"] = thd
+        # RMS / peak signal level (all modes)
+        if len(final_seg) > 0:
+            metrics["rms_signal"] = round(float(np.sqrt(np.mean(final_seg.astype(float) ** 2))), 6)
+            metrics["peak_dBFS"] = round(float(20 * log_f(max(np.max(np.abs(final_seg)), 1e-30))), 2)
 
-        # Harmonics
-        harmonics = compute_harmonics_for_overdrive(final_seg, fs)
-        metrics["harmonics"] = harmonics
-
-        # Odd/even ratio
-        oe = compute_odd_even_ratio(final_seg, fs)
-        if oe:
-            metrics["odd_even_ratio"] = oe
+        # THD / Harmonics — sweep only (noise has no periodic fundamental)
+        if self.signal_type == "sweep":
+            metrics["thd"] = compute_thd(final_seg, fs)
+            metrics["harmonics"] = compute_harmonics_for_overdrive(final_seg, fs)
+            oe = compute_odd_even_ratio(final_seg, fs)
+            if oe:
+                metrics["odd_even_ratio"] = oe
 
         # Noise spectral shape analysis (for noise methods)
         if noise_method in ("pink", "brown", "white") and len(freq_array) > 0:
@@ -665,6 +504,10 @@ class AnalyzerWorker(threading.Thread):
             metrics["noise_shape"] = shape_result
 
         # Octave band stats (final)
+        oct_groups = [(20, 100, "Sub-bass"), (100, 300, "Bass"), (300, 800, "Low-mid"),
+                      (800, 2000, "Mid"), (2000, 5000, "Upper-mid"), (5000, 10000, "Presence"),
+                      (10000, 20000, "Brilliance")]
+
         if self.signal_type == "sweep":
             # For sweep: use per-tone dBFS values for meaningful octave bands
             measured_db, rms_arr = extract_tone_measurements(
@@ -672,17 +515,11 @@ class AnalyzerWorker(threading.Thread):
                 gap_s=float(self.params.get("gap_s", 0.2)), fs=int(fs))
             valid_tones = ~np.isnan(measured_db)
 
-            # RMS / signal strength for sweep (useful metric not available from dBFS alone)
-            if len(final_seg) > 0:
-                metrics["rms_signal"] = round(float(np.sqrt(np.mean(final_seg.astype(float) ** 2))), 6)
-                metrics["peak_dBFS"] = round(float(20 * log_f(max(np.max(np.abs(final_seg)), 1e-30))), 2)
-
-            octaves = [(20, 100, "Sub-bass"), (100, 300, "Bass"), (300, 800, "Low-mid"),
-                       (800, 2000, "Mid"), (2000, 5000, "Upper-mid"), (5000, 10000, "Presence"),
-                       (10000, 20000, "Brilliance")]
-
             octave_bands = {}
-            for lo, hi, name in octaves:
+            thd_per_band = {}
+            all_thd = []  # collect every valid tone's THD for global average
+
+            for lo, hi, name in oct_groups:
                 tone_mask = valid_tones & (freq_array >= lo) & (freq_array < hi)
                 if np.sum(tone_mask) > 0:
                     vals = measured_db[tone_mask]
@@ -692,15 +529,81 @@ class AnalyzerWorker(threading.Thread):
                         "std_dB": round(float(np.std(vals)), 2),
                         "tones": int(np.sum(tone_mask)),
                     }
+
+            # Per-tone THD for sweep mode
+            tone_dur_s = self.params.get("tone_duration", 0.7)
+            gap_s_val = self.params.get("gap_s", 0.2)
+            params = {"tone_duration": tone_dur_s, "gap_s": gap_s_val}
+            freqs_thd, thd_vals, _ = compute_thd_per_tone_with_freqs(
+                final_seg, int(fs), freq_array, params=params)
+            valid_thd = ~np.isnan(thd_vals) if hasattr(thd_vals, '__iter__') else thd_vals > 0
+
+            for lo, hi, name in oct_groups:
+                band_mask = (freqs_thd >= lo) & (freqs_thd < hi) & valid_thd
+                if np.sum(band_mask) > 0:
+                    band_thd = thd_vals[band_mask]
+                    thd_per_band[name] = {
+                        "mean_pct": round(float(np.mean(band_thd)), 3),
+                        "std_pct": round(float(np.std(band_thd)), 3),
+                        "tones": int(np.sum(band_mask)),
+                    }
+                    all_thd.extend(band_thd.tolist())
+
+            if len(all_thd) > 0:
+                metrics["thd_global"] = round(float(np.mean(all_thd)), 3)
+            else:
+                metrics["thd_global"] = None
+
+            # Per-band RMS (sweep): rms_arr from extract_tone_measurements matches freq_array order
+            rms_per_band = {}
+            for lo, hi, name in oct_groups:
+                band_mask = (freq_array >= lo) & (freq_array < hi) & valid_tones
+                if np.sum(band_mask) > 0:
+                    band_rms = rms_arr[band_mask]
+                    rms_per_band[name] = {
+                        "mean": round(float(np.mean(band_rms)), 6),
+                        "max": round(float(np.max(np.abs(band_rms))), 6),
+                        "tones": int(np.sum(band_mask)),
+                    }
+
+            metrics["thd_per_band"] = thd_per_band
             metrics["octave_bands"] = octave_bands
+            metrics["rms_per_band"] = rms_per_band
         else:
-            # Noise mode: use full FFT-based analysis
+            # Noise mode: FFT-based octave band stats
             octave_stats = compute_octave_band_stats(
                 final_seg, freq_array if len(freq_array) > 0 else np.array([40]), fs)
             # Tag noise-mode bands for renderer
             for n in octave_stats:
                 octave_stats[n]["kind"] = "noise"
             metrics["octave_bands"] = octave_stats
+
+            # Per-band RMS (noise): compute true time-domain signal energy per band,
+            # normalized by number of bins so the result is spectral density (RMS/Hz).
+            # This ensures that for white noise (flat PSD), all bands show approximately
+            # equal values — regardless of how many FFT bins fall in each band.
+            fft_full = np.fft.rfft(final_seg.astype(np.float64))
+            fft_freqs = np.fft.rfftfreq(len(final_seg), d=1.0 / fs)
+            n = len(final_seg)
+            rms_per_band = {}
+            for lo, hi, name in oct_groups:
+                band_mask = (fft_freqs >= lo) & (fft_freqs < hi)
+                if np.sum(band_mask) > 2:
+                    fft_band = fft_full.copy()
+                    fft_band[~band_mask] = 0
+                    # Normalize by sqrt(N_B * n): FFT zero-out gives sqrt(sum(E_k / n)),
+                    # dividing bins by sqrt(N_B) converts from "total per-band amplitude" to
+                    # "spectral density (RMS/Hz)" — independent of bin count.
+                    N_B = np.sum(band_mask)
+                    band_signal = np.real(np.fft.irfft(fft_band / np.sqrt(N_B), n=n))
+                    band_rms = float(np.sqrt(np.mean(band_signal ** 2)))
+                    rms_per_band[name] = {
+                        "mean": round(band_rms, 6),
+                        "max": round(float(np.max(np.abs(band_signal))), 6),
+                        "tones": int(N_B),
+                    }
+
+            metrics["rms_per_band"] = rms_per_band
 
         return metrics
 
@@ -974,24 +877,39 @@ class AmpAnalyzerApp:
             lbl.pack(anchor="nw")
             self._octave_labels[name] = lbl
 
-        # RMS / Signal strength
-        rms_frame = ttk.Frame(right)
-        rms_frame.pack(fill=tk.X, pady=(4, 2), anchor="w")
-        ttk.Label(rms_frame, text="Signal Level:", font=("Consolas", 9, "bold")).pack(anchor="nw")
-        self._rms_label = ttk.Label(rms_frame, text="  RMS: -- / Peak dBFS: --", font=("Consolas", 8))
-        self._rms_label.pack(anchor="nw")
+        # Signal Level (per-band RMS + overall stats)
+        self._sl_frame = ttk.Frame(right)
+        self._sl_frame.pack(fill=tk.X, pady=(6, 2), anchor="w")
+        ttk.Label(self._sl_frame, text="Signal Level:", font=("Consolas", 9, "bold")).pack(anchor="nw")
 
-        # Harmonics / THD
+        # Per-band RMS labels
+        self._sl_rms_labels = {}
+        for name in ["Sub-bass", "Bass", "Low-mid", "Mid", "Upper-mid", "Presence", "Brilliance"]:
+            lbl = ttk.Label(self._sl_frame, text="%-12s  --" % (name + ":"), font=("Consolas", 8))
+            lbl.pack(anchor="nw")
+            self._sl_rms_labels[name] = lbl
+
+        # Overall stats
+        self._sl_rms_val = ttk.Label(self._sl_frame, text="  RMS: --", font=("Consolas", 8))
+        self._sl_rms_val.pack(anchor="nw")
+        self._sl_peak_rms_val = ttk.Label(self._sl_frame, text="  Peak RMS: --", font=("Consolas", 8))
+        self._sl_peak_rms_val.pack(anchor="nw")
+        self._sl_peak_dbfs_val = ttk.Label(self._sl_frame, text="  Peak dBFS: --", font=("Consolas", 8))
+        self._sl_peak_dbfs_val.pack(anchor="nw")
+
+        # THD / Harmonics (per-band + global average)
         harm_grp = ttk.Frame(right)
         harm_grp.pack(fill=tk.X, pady=(6, 2), anchor="w")
         ttk.Label(harm_grp, text="THD / Harmonics:", font=("Consolas", 9, "bold")).pack(anchor="nw")
 
-        self._thd_label = ttk.Label(harm_grp, text="  THD: -- %", font=("Consolas", 8))
-        self._thd_label.pack(anchor="nw")
-        self._fund_label = ttk.Label(harm_grp, text="  Fundamental: -- Hz", font=("Consolas", 8))
-        self._fund_label.pack(anchor="nw")
-        self._harmonics_frame = ttk.Frame(harm_grp)
-        self._harmonics_frame.pack(fill=tk.X, anchor="w")
+        self._thd_labels = {}
+        for name in ["Sub-bass", "Bass", "Low-mid", "Mid", "Upper-mid", "Presence", "Brilliance"]:
+            lbl = ttk.Label(harm_grp, text="%-12s  --" % (name + ":"), font=("Consolas", 8))
+            lbl.pack(anchor="nw")
+            self._thd_labels[name] = lbl
+
+        self._thd_global_lbl = ttk.Label(harm_grp, text="  Global avg: --", font=("Consolas", 8))
+        self._thd_global_lbl.pack(anchor="nw")
 
         # Noise shape analysis (for noise methods)
         self._noise_shape_frame = ttk.Frame(right)
@@ -1340,52 +1258,88 @@ class AmpAnalyzerApp:
         if not m:
             return
 
-        # Frequency Response Summary
+        # Frequency Response Summary (kept as-is for now)
         fr = m.get("freq_response", {})
-        lines = [
-            "Freq Response:",
-            "  Valid bins : %d" % fr.get("valid_bins", 0),
-            "  Mean amp   : %+.1f dBFS" % fr.get("mean_dBFS", 0),
-            "  Std dev    : %.2f dB" % fr.get("std_dB", 0),
-            "  Max amp    : %+.1f dBFS" % fr.get("max_dBFS", 0),
-            "  Min amp    : %+.1f dBFS" % fr.get("min_dBFS", 0),
-        ]
+        fr_text = "Freq Response:\n"
+        fr_text += "  Valid bins : %d\n" % fr.get("valid_bins", 0)
+        fr_text += "  Mean amp   : %+.1f dBFS\n" % fr.get("mean_dBFS", 0)
+        fr_text += "  Std dev    : %.2f dB\n" % fr.get("std_dB", 0)
+        fr_text += "  Max amp    : %+.1f dBFS\n" % fr.get("max_dBFS", 0)
+        fr_text += "  Min amp    : %+.1f dBFS" % fr.get("min_dBFS", 0)
+        self._lbl_metrics_frame.config(text=fr_text)
 
-        # Octave bands
+        # Octave bands (dB stats only — separate from RMS / THD)
         octave_data = m.get("octave_bands", {})
+
         for name in ["Sub-bass", "Bass", "Low-mid", "Mid", "Upper-mid", "Presence", "Brilliance"]:
             d = octave_data.get(name, {})
             if not d:
-                val = "n/a"
-            elif d.get("kind") == "sweep":
-                # Sweep mode: show mean dBFS and tone count (per-tone FFT results)
+                self._octave_labels[name].config(text="%-12s  n/a" % (name + ":"))
+                continue
+            if d.get("kind") == "sweep":
                 mean_val = d.get("mean_dB", "--")
                 std_val = d.get("std_dB", "--")
                 tones = d.get("tones", 0)
                 val = "%+.1f / %+.1f dB (%d tones)" % (mean_val, std_val, tones)
-            else:
-                # Noise mode: min/max from FFT-based analysis
+            elif d.get("kind") == "noise":
                 mn = d.get("min_dB", "--")
                 mx = d.get("max_dB", "--")
                 val = "%+.1f / %+.1f dB (%.1f std)" % (mn, mx, d.get("std_dB", 0))
+            else:
+                val = "n/a"
             self._octave_labels[name].config(text="%-12s  %s" % (name + ":", val))
 
-        # RMS / signal strength (available for sweep mode)
-        if "rms_signal" in m:
-            rms = m["rms_signal"]
-            peak = m.get("peak_dBFS", "--")
-            self._rms_label.config(text="  RMS: %+.2f (%+.1f dBFS) Peak: %+.1f dBFS" % (rms, rms, peak))
-        else:
-            self._rms_label.config(text="  RMS: -- / Peak dBFS: --")
+        # ── Signal Level section: per-band RMS + overall stats ──────────────
+        rms_per_band = m.get("rms_per_band", {})
 
-        # THD / Harmonics
-        thd = m.get("thd", {})
-        thd_val = thd.get("thd_pct")
-        if thd_val is not None:
-            self._thd_label.config(text="  THD: %.3f %% (%.1f Hz)" % (thd_val, thd.get("fundamental_freq_hz", 0)))
-            self._fund_label.config(text="  Fundamental: %.1f Hz" % thd.get("fundamental_freq_hz", 0))
+        for name in ["Sub-bass", "Bass", "Low-mid", "Mid", "Upper-mid", "Presence", "Brilliance"]:
+            rb = rms_per_band.get(name, {})
+            if rb:
+                mean_v = rb["mean"]
+                # Fixed-point with adaptive precision (no scientific notation)
+                if abs(mean_v) >= 0.01:
+                    mean_str = "%.4f" % mean_v
+                elif abs(mean_v) >= 0.001:
+                    mean_str = "%.5f" % mean_v
+                else:
+                    mean_str = "%.6f" % mean_v
+                # Strip trailing zeros
+                if "." in mean_str:
+                    mean_str = mean_str.rstrip("0").rstrip(".")
+                dbfs_str = "%+.1f" % (20 * log_f(max(mean_v, 1e-30)))
+                val = "%s (%s dBFS)" % (mean_str, dbfs_str)
+            else:
+                val = "--"
+            self._sl_rms_labels[name].config(text="%-12s  %s" % (name + ":", val))
+
+        # Overall stats
+        if m.get("rms_signal") is not None:
+            rms_val = m["rms_signal"]
+            peak_dbfs = m.get("peak_dBFS", "--")
+            self._sl_rms_val.config(text="  RMS: %+.4f (%+.1f dBFS)" % (rms_val, 20 * log_f(max(rms_val, 1e-30))))
+            self._sl_peak_rms_val.config(text="  Peak RMS: N/A")
+            self._sl_peak_dbfs_val.config(text="  Peak dBFS: %s" % str(peak_dbfs))
         else:
-            self._thd_label.config(text="  THD: --")
+            self._sl_rms_val.config(text="  RMS: --")
+            self._sl_peak_rms_val.config(text="  Peak RMS: --")
+            self._sl_peak_dbfs_val.config(text="  Peak dBFS: --")
+
+        # ── THD / Harmonics section: per-band + global average (sweep only) ──
+        thd_per_band = m.get("thd_per_band", {})
+        thd_global = m.get("thd_global")
+
+        for name in ["Sub-bass", "Bass", "Low-mid", "Mid", "Upper-mid", "Presence", "Brilliance"]:
+            tb = thd_per_band.get(name)
+            if tb and tb.get("tones", 0) > 0:
+                val = "%.3f %%" % tb["mean_pct"]
+            else:
+                val = "--"
+            self._thd_labels[name].config(text="%-12s  %s" % (name + ":", val))
+
+        if thd_global is not None and math.isfinite(thd_global):
+            self._thd_global_lbl.config(text="  Global avg: %.3f %% (%.0f tones)" % (thd_global, sum(tb.get("tones", 0) for tb in thd_per_band.values())))
+        else:
+            self._thd_global_lbl.config(text="  Global avg: --")
 
         # Noise shape analysis
         if "noise_shape" in m:
