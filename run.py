@@ -32,11 +32,11 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 _REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_REPO_ROOT))
 
-from config import log_f, config as _cfg_module
+from config import config as _cfg_module, log_f
 from utils.audio.signal_utils import generate_noise_signal, generate_sweep_sequence
 from utils.audio.analysis_utils import (analyze_noise_response, compare_noise_spectral_shape,
     smooth_moving_average, extract_tone_measurements, compute_thd, compute_thd_per_tone_with_freqs,
-    compute_harmonics_for_overdrive, compute_odd_even_ratio, compute_octave_band_stats)
+    compute_harmonics_for_overdrive, compute_odd_even_ratio)
 
 
 class _Config:
@@ -280,7 +280,7 @@ class AnalyzerWorker(threading.Thread):
             n = min(frame_count, len(full_capture) - idx)
             if n > 0 and not self._stop_event.is_set():
                 full_capture[idx : idx + n] = indata.flatten()[:n].astype(np.float32)
-            capture_start[0] += float(n)
+                capture_start[0] += float(n)
 
 
         def _out_cb(outdata, frame_count, time_flag, status):
@@ -325,16 +325,21 @@ class AnalyzerWorker(threading.Thread):
                 n_to_analyze = int(capture_start[0])
                 if n_to_analyze > fs:  # need at least 1 second of data
                     seg = full_capture[:n_to_analyze].astype(np.float64)
-                    # Progressive FFT on log-spaced frequency bins
+                    # Progressive RMS-based dBFS on log-spaced frequency bins
                     freqs_out, amp_db, rms_arr = analyze_noise_response(
                         captured_signal=seg, freq_array=list(freq_array) if len(freq_array) > 0 else [], fs=int(fs))
 
+                    # Convert to RMS-based dBFS for consistent power measurement
+                    valid_noise = ~np.isnan(rms_arr)
+                    amp_db_rms = np.full_like(amp_db, float("nan"))
+                    amp_db_rms[valid_noise] = 20 * log_f(np.maximum(rms_arr[valid_noise], 1e-30))
+
                     # Smooth the response for chart display
-                    smoothed_db = smooth_moving_average(amp_db, window_size=_cfg_module.smoothing_neighbors)
+                    smoothed_db = smooth_moving_average(amp_db_rms, window_size=_cfg_module.smoothing_neighbors)
 
                     capture_queue.put((self.MSG_CHART, {
                         "freqs": freqs_out,
-                        "amp_db": amp_db,
+                        "amp_db": amp_db_rms,
                         "smoothed_db": smoothed_db,
                         "rms": rms_arr,
                         "elapsed_s": elapsed,
@@ -375,10 +380,13 @@ class AnalyzerWorker(threading.Thread):
                 )
                 valid = ~np.isnan(measured_db)
                 if np.any(valid):
+                    # Use RMS-based dBFS for consistent power measurement
+                    amp_db_rms = 20 * log_f(np.maximum(rms_arr[valid], 1e-30))
+                    smoothed_db_rms = smooth_moving_average(amp_db_rms, window_size=_cfg_module.smoothing_neighbors)
                     capture_queue.put((self.MSG_CHART, {
                         "freqs": freq_array[valid],
-                        "amp_db": measured_db,
-                        "smoothed_db": smooth_moving_average(measured_db[valid], window_size=_cfg_module.smoothing_neighbors),
+                        "amp_db": amp_db_rms,
+                        "smoothed_db": smoothed_db_rms,
                         "rms": rms_arr[valid],
                         "elapsed_s": elapsed,
                         "progress": 100.0,
@@ -392,11 +400,15 @@ class AnalyzerWorker(threading.Thread):
                 freqs_out, amp_db, rms_arr = analyze_noise_response(
                     captured_signal=final_seg, freq_array=list(freq_array) if len(freq_array) > 0 else [], fs=int(fs))
 
-                smoothed_db_final = smooth_moving_average(amp_db, window_size=_cfg_module.smoothing_neighbors)
+                # Convert to RMS-based dBFS for consistent power measurement
+                valid_noise = ~np.isnan(rms_arr)
+                amp_db_rms = np.full_like(amp_db, float("nan"))
+                amp_db_rms[valid_noise] = 20 * log_f(np.maximum(rms_arr[valid_noise], 1e-30))
+                smoothed_db_final = smooth_moving_average(amp_db_rms, window_size=_cfg_module.smoothing_neighbors)
 
                 capture_queue.put((self.MSG_CHART, {
                     "freqs": freqs_out,
-                    "amp_db": amp_db,
+                    "amp_db": amp_db_rms,
                     "smoothed_db": smoothed_db_final,
                     "rms": rms_arr,
                     "elapsed_s": elapsed,
@@ -420,22 +432,41 @@ class AnalyzerWorker(threading.Thread):
         valid_freqs, amp_db, rms = analyze_noise_response(
             captured_signal=seg, freq_array=freq_array, fs=fs)
 
-        n_valid = np.sum(~np.isnan(amp_db))
+        # Use RMS-based dBFS consistently (power measurement independent of phase alignment)
+        valid_mask = ~np.isnan(rms)
+        db_valid_rms = 20 * log_f(np.maximum(rms[valid_mask], 1e-30))
+        n_valid = int(np.sum(valid_mask))
         if n_valid < 3:
             return None
 
-        db_valid = amp_db[~np.isnan(amp_db)]
-
         metrics = {
-            "valid_bins": int(n_valid),
-            "mean_dBFS": round(float(np.mean(db_valid)), 2),
-            "std_dB": round(float(np.std(db_valid)), 3),
-            "min_dBFS": round(float(np.min(db_valid)), 2),
-            "max_dBFS": round(float(np.max(db_valid)), 2),
+            "valid_bins": n_valid,
+            "mean_dBFS": round(float(np.mean(db_valid_rms)), 2),
+            "std_dB": round(float(np.std(db_valid_rms)), 3),
+            "min_dBFS": round(float(np.min(db_valid_rms)), 2),
+            "max_dBFS": round(float(np.max(db_valid_rms)), 2),
         }
 
-        # Octave band stats
-        octave_stats = compute_octave_band_stats(seg, freq_array if len(freq_array) > 0 else np.array([40]), fs)
+        # Octave band stats (RMS-based dBFS per band)
+        octave_stats = {}
+        fft_full = np.fft.rfft(seg.astype(np.float64))
+        fft_freqs = np.fft.rfftfreq(len(seg), d=1.0 / fs)
+        for lo, hi, name in [(20, 100, "Sub-bass"), (100, 300, "Bass"), (300, 800, "Low-mid"),
+                              (800, 2000, "Mid"), (2000, 5000, "Upper-mid"), (5000, 10000, "Presence"),
+                              (10000, 20000, "Brilliance")]:
+            band_mask = (fft_freqs >= lo) & (fft_freqs < hi)
+            if np.sum(band_mask) > 2:
+                fft_band = fft_full.copy()
+                fft_band[~band_mask] = 0
+                N_B = np.sum(band_mask)
+                band_signal = np.real(np.fft.irfft(fft_band / np.sqrt(N_B), n=len(seg)))
+                band_rms = float(np.sqrt(np.mean(band_signal ** 2)))
+                octave_stats[name] = {
+                    "kind": "noise",
+                    "mean_dBFS": round(float(20 * log_f(max(band_rms, 1e-30))), 2),
+                    "std_dB": 0.0,
+                    "tones": int(N_B),
+                }
         metrics["octave_bands"] = octave_stats
 
         # Overall RMS/Peak (all modes — live only for noise; sweep uses _compute_final_metrics at end)
@@ -476,13 +507,19 @@ class AnalyzerWorker(threading.Thread):
         # Frequency response stats (on correction-applied data if enabled)
         valid_freqs, amp_db, rms = analyze_noise_response(
             captured_signal=final_seg, freq_array=freq_array, fs=fs)
-        db_valid = amp_db[~np.isnan(amp_db)]
+
+        # Use RMS-based dBFS consistently for frequency response stats (power measurement
+        # independent of phase alignment — coherent FFT bins lose energy from timing jitter)
+        valid_mask = ~np.isnan(rms)
+        db_valid_rms = 20 * log_f(np.maximum(rms[valid_mask], 1e-30))
+        n_valid = int(np.sum(valid_mask))
+
         metrics["freq_response"] = {
-            "valid_bins": int(np.sum(~np.isnan(amp_db))),
-            "mean_dBFS": round(float(np.mean(db_valid)), 2),
-            "std_dB": round(float(np.std(db_valid)), 3),
-            "min_dBFS": round(float(np.min(db_valid)), 2),
-            "max_dBFS": round(float(np.max(db_valid)), 2),
+            "valid_bins": n_valid,
+            "mean_dBFS": round(float(np.mean(db_valid_rms)), 2),
+            "std_dB": round(float(np.std(db_valid_rms)), 3),
+            "min_dBFS": round(float(np.min(db_valid_rms)), 2),
+            "max_dBFS": round(float(np.max(db_valid_rms)), 2),
         }
 
         # RMS / peak signal level (all modes)
@@ -509,7 +546,7 @@ class AnalyzerWorker(threading.Thread):
                       (10000, 20000, "Brilliance")]
 
         if self.signal_type == "sweep":
-            # For sweep: use per-tone dBFS values for meaningful octave bands
+            # For sweep: use per-tone RMS for meaningful power measurement
             measured_db, rms_arr = extract_tone_measurements(
                 final_seg, freq_array, tone_duration_s=self.params.get("tone_duration", 0.7),
                 gap_s=float(self.params.get("gap_s", 0.2)), fs=int(fs))
@@ -522,11 +559,11 @@ class AnalyzerWorker(threading.Thread):
             for lo, hi, name in oct_groups:
                 tone_mask = valid_tones & (freq_array >= lo) & (freq_array < hi)
                 if np.sum(tone_mask) > 0:
-                    vals = measured_db[tone_mask]
+                    vals = rms_arr[tone_mask]
                     octave_bands[name] = {
                         "kind": "sweep",
-                        "mean_dB": round(float(np.mean(vals)), 2),
-                        "std_dB": round(float(np.std(vals)), 2),
+                        "mean_dBFS": round(float(20 * log_f(max(vals.mean(), 1e-30))), 2),
+                        "std_dB": round(float(np.std(20 * log_f(np.maximum(vals, 1e-30)))), 2),
                         "tones": int(np.sum(tone_mask)),
                     }
 
@@ -570,39 +607,34 @@ class AnalyzerWorker(threading.Thread):
             metrics["octave_bands"] = octave_bands
             metrics["rms_per_band"] = rms_per_band
         else:
-            # Noise mode: FFT-based octave band stats
-            octave_stats = compute_octave_band_stats(
-                final_seg, freq_array if len(freq_array) > 0 else np.array([40]), fs)
-            # Tag noise-mode bands for renderer
-            for n in octave_stats:
-                octave_stats[n]["kind"] = "noise"
-            metrics["octave_bands"] = octave_stats
-
-            # Per-band RMS (noise): compute true time-domain signal energy per band,
-            # normalized by number of bins so the result is spectral density (RMS/Hz).
-            # This ensures that for white noise (flat PSD), all bands show approximately
-            # equal values — regardless of how many FFT bins fall in each band.
+            # Noise mode: use RMS-based dBFS for octave band stats
             fft_full = np.fft.rfft(final_seg.astype(np.float64))
             fft_freqs = np.fft.rfftfreq(len(final_seg), d=1.0 / fs)
-            n = len(final_seg)
+
+            octave_stats = {}
             rms_per_band = {}
             for lo, hi, name in oct_groups:
                 band_mask = (fft_freqs >= lo) & (fft_freqs < hi)
                 if np.sum(band_mask) > 2:
                     fft_band = fft_full.copy()
                     fft_band[~band_mask] = 0
-                    # Normalize by sqrt(N_B * n): FFT zero-out gives sqrt(sum(E_k / n)),
-                    # dividing bins by sqrt(N_B) converts from "total per-band amplitude" to
-                    # "spectral density (RMS/Hz)" — independent of bin count.
+                    # FFT zero-out + IFFT extracts the band's signal component
                     N_B = np.sum(band_mask)
-                    band_signal = np.real(np.fft.irfft(fft_band / np.sqrt(N_B), n=n))
+                    band_signal = np.real(np.fft.irfft(fft_band / np.sqrt(N_B), n=len(final_seg)))
                     band_rms = float(np.sqrt(np.mean(band_signal ** 2)))
+                    octave_stats[name] = {
+                        "kind": "noise",
+                        "mean_dBFS": round(float(20 * log_f(max(band_rms, 1e-30))), 2),
+                        "std_dB": 0.0,
+                        "tones": int(N_B),
+                    }
                     rms_per_band[name] = {
                         "mean": round(band_rms, 6),
                         "max": round(float(np.max(np.abs(band_signal))), 6),
                         "tones": int(N_B),
                     }
 
+            metrics["octave_bands"] = octave_stats
             metrics["rms_per_band"] = rms_per_band
 
         return metrics
@@ -1277,14 +1309,17 @@ class AmpAnalyzerApp:
                 self._octave_labels[name].config(text="%-12s  n/a" % (name + ":"))
                 continue
             if d.get("kind") == "sweep":
-                mean_val = d.get("mean_dB", "--")
+                mean_val = d.get("mean_dBFS", "--")
                 std_val = d.get("std_dB", "--")
                 tones = d.get("tones", 0)
                 val = "%+.1f / %+.1f dB (%d tones)" % (mean_val, std_val, tones)
             elif d.get("kind") == "noise":
-                mn = d.get("min_dB", "--")
-                mx = d.get("max_dB", "--")
-                val = "%+.1f / %+.1f dB (%.1f std)" % (mn, mx, d.get("std_dB", 0))
+                mn = d.get("min_dBFS", d.get("mean_dBFS", 0))
+                mx = d.get("max_dBFS", d.get("mean_dBFS", 0))
+                if isinstance(mn, str):
+                    val = "n/a"
+                else:
+                    val = "%+.1f / %+.1f dB (%.1f std)" % (mn, mx, d.get("std_dB", 0))
             else:
                 val = "n/a"
             self._octave_labels[name].config(text="%-12s  %s" % (name + ":", val))
