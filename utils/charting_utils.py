@@ -1,247 +1,156 @@
-"""Chart-building utilities for PyAmpScope calibration scripts.
-
-Each function returns raw PNG bytes via an in-memory buffer.
-All charts use a log-frequency x-axis and headless matplotlib backend.
-"""
+"""Chart construction helpers for PyAmpScope."""
+from __future__ import annotations
 
 import io
 import numpy as np
-from pathlib import Path
-import sys
-
-
-# Add repo root to path so we can import config directly
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_REPO_ROOT))
 
 from .audio.analysis_utils import smooth_moving_average
-from config import log_base
+from .audio.levels import undb20
 
 
-def build_multichart_png(
-    freqs: np.ndarray,
-    H_db: np.ndarray,
-    num_neighbors: int = 5,
-    title: str = "Calibration Response",
-) -> bytes:
-    """Build a 3-panel PNG chart: response (raw + smoothed), deviation (sigma), correction factor.
+def _safe_span(values, minimum=1.0):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return -minimum, minimum
+    lo, hi = float(np.min(values)), float(np.max(values))
+    if hi - lo < minimum:
+        mid = (hi + lo) / 2.0
+        return mid - minimum/2, mid + minimum/2
+    margin = (hi-lo)*0.08
+    return lo-margin, hi+margin
 
-    Parameters
-    ----------
-    freqs : log-spaced frequency bins in Hz.
-    H_db : measured amplitude in dBFS at each bin (may be negative).
-    num_neighbors : total points in moving average window (default 5 = +/-2).
-    title : chart title.
-    """
+
+def build_multichart_png(freqs, H_db, num_neighbors=5, title="Calibration Response"):
+    """Calibration chart: measured response, deviation, inverse correction."""
     import matplotlib
-
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    # Clamp to valid dB range and compute statistics from unsmoothed data
-    H_mag_db = np.maximum(H_db, -200)
-
-    # Smoothing for the correction factor — moving average over nearest neighbors
-    H_smoothed_db = smooth_moving_average(H_mag_db, window_size=num_neighbors)
-    mean_db = float(np.mean(H_mag_db))
-    std_db = float(np.std(H_mag_db))
-
-    # Deviation (sigma) from the charting perspective
-    #deviation_db = H_mag_db - mean_db
-    deviation_db = H_smoothed_db - mean_db  # Use the smoothed signal when displaying deviation
-    deviation_sigma = deviation_db / max(std_db, 1e-10)
-
-    # Correction factor in linear space:
-    #   correction = H_mean_linear / H_smoothed_linear
-    # = 10^((H_mean_dB - H_smoothed_dB) / 20)
-    h_diff_db = mean_db - H_smoothed_db
-    correction_factor = log_base ** (h_diff_db / 20.0)
-
-    dev_ylabel = f"Deviation (sigma={std_db:.2f}dB)"
-
-    # 3 panels stacked
-    fig, axes = plt.subplots(3, 1, figsize=(12, 10), dpi=120, sharex=True)
-    fig.suptitle(title, fontsize=14, fontweight="bold")
-
-    # Panel 1: Frequency response (raw + smoothed trend)
-    ax = axes[0]
-    ax.set_ylabel("Magnitude (dB)")
-    ax.plot(freqs, H_mag_db, "r-", linewidth=1.2, alpha=0.7, label="Measured (raw)")
-    ax.plot(freqs, H_smoothed_db, "g--", linewidth=1.5, alpha=0.8, label="Smoothed trend")
-    ax.axhline(mean_db, color="gray", linewidth=0.8, linestyle="--", alpha=0.6, label=f"Mean ({mean_db:.1f} dB)")
-    ax.grid(True, which="major", axis="x", alpha=0.3)
-    y_min = min(H_mag_db.min(), H_smoothed_db.min())
-    y_max = max(H_mag_db.max(), H_smoothed_db.max())
-    y_range = y_max - y_min
-    ax.set_ylim(y_min - y_range * 0.05, y_max + y_range * 0.05)
-    ax.legend(loc="upper right", fontsize=9)
-
-    # Panel 2: Deviation in standard deviations
-    ax = axes[1]
-    ax.set_ylabel(dev_ylabel)
-    ax.plot(freqs, deviation_sigma, "b-", linewidth=1.0, alpha=0.7)
-    ax.axhline(0, color="red", linewidth=0.8, linestyle="--")
-    ax.axhline(2, color="orange", linewidth=0.5, linestyle=":", alpha=0.5, label="+/- 2 sigma")
-    ax.axhline(-2, color="orange", linewidth=0.5, linestyle=":", alpha=0.5)
-    ax.grid(True, which="major", axis="x", alpha=0.3)
-    y_max_s = max(np.max(deviation_sigma), -np.min(deviation_sigma))
-    ax.set_ylim(-y_max_s * 1.05, y_max_s * 1.05)
-
-    # Panel 3: Correction factor
-    ax = axes[2]
-    ax.set_ylabel("Correction factor")
-    ax.plot(freqs, correction_factor, "m-", linewidth=1.2, alpha=0.8)
-    ax.axhline(1.0, color="gray", linewidth=0.8, linestyle="--")
-    ax.grid(True, which="major", axis="x", alpha=0.3)
-    y_min_c = min(correction_factor.min(), 0.95)
-    y_max_c = max(correction_factor.max(), 1.05)
-    y_range_c = y_max_c - y_min_c
-    ax.set_ylim(y_min_c - y_range_c * 0.05, y_max_c + y_range_c * 0.05)
-
-    axes[2].set_xlabel("Frequency (Hz)")
-    for ax in axes:
-        ax.set_xscale("log")
-        ax.set_xlim(max(freqs[0], 20), freqs[-1])
-
-    fig.tight_layout()
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return buf.read(), correction_factor, H_smoothed_db
-
-
-def build_validate_chart_png(
-    freqs: np.ndarray,
-    deviation_db: np.ndarray,
-    pct_dev: np.ndarray,
-    title: str = "Validation Result",
-) -> bytes:
-    """Build a 2-panel PNG chart: deviation (dB) vs deviation (%)."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, axes = plt.subplots(1, 2, figsize=(16, 5), dpi=120)
-    fig.suptitle(title, fontsize=14, fontweight="bold")
-
-    # Panel 1: Deviation from mean in dB
-    ax = axes[0]
-    ax.plot(freqs, deviation_db, "b-", linewidth=1.0, alpha=0.7)
-    ax.axhline(0, color="red", linewidth=0.8, linestyle="--")
-    ax.set_ylabel("Deviation (dB)")
-    ax.set_xscale("log")
-    ax.grid(True, which="major", axis="x", alpha=0.3)
-    y_max = max(np.max(deviation_db), -np.min(deviation_db))
-    ax.set_ylim(-y_max * 1.1, y_max * 1.1)
-
-    # Panel 2: Absolute percentage deviation from arithmetic mean (linear)
-    ax = axes[1]
-    ax.plot(freqs, pct_dev, "g-", linewidth=1.0, alpha=0.7)
-    ax.set_ylabel("Abs % Deviation")
-    ax.set_xscale("log")
-    ax.grid(True, which="major", axis="x", alpha=0.3)
-
-    axes[1].set_xlabel("Frequency (Hz)")
-
-    fig.tight_layout()
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return buf.read()
-
-
-def build_noise_chart_png(
-    freqs: np.ndarray,
-    H_db: np.ndarray,
-    smoothed_db: np.ndarray,
-    expected_db: np.ndarray,
-    deviation_db: np.ndarray,
-    corr_factors: np.ndarray,
-    num_neighbors: int = 5,
-    title: str = "Noise Calibration Response",
-) -> bytes:
-    """Build a 3-panel PNG chart for pink/brown noise calibration.
-
-    Uses the theoretical input profile shifted to match measurement level as
-    reference for deviation and correction (percent-based).
-
-    Parameters
-    ----------
-    freqs : log-spaced frequency bins in Hz.
-    H_db : measured amplitude in dBFS at each bin (raw).
-    smoothed_db : smoothed measured amplitude (same window as ``num_neighbors``).
-    expected_db : theoretical spectral density of input noise method in dB (may be shifted).
-    deviation_db : smoothed_db - expected_db (dB from shifted reference, or percent if
-                   the caller computes it that way -- detected automatically).
-    corr_factors : per-bin correction factors to undo chain coloration.
-    num_neighbors : total points in moving average window (default 5 = +/-2).
-    title : chart title.
-    """
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    freqs = np.asarray(freqs, dtype=float)
+    H_db = np.asarray(H_db, dtype=float)
+    smooth = smooth_moving_average(H_db, num_neighbors)
+    reference = float(np.nanmedian(smooth))
+    deviation = smooth - reference
+    correction = undb20(-deviation)
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 10), dpi=120, sharex=True)
     fig.suptitle(title, fontsize=14, fontweight="bold")
+    axes[0].plot(freqs, H_db, label="Measured")
+    axes[0].plot(freqs, smooth, label="Smoothed")
+    axes[0].axhline(reference, linestyle="--", label=f"Median ({reference:.2f} dB)")
+    axes[0].set_ylabel("Response (dB)")
+    axes[0].legend(fontsize=9)
 
-    # Panel 1: Frequency response (raw + smoothed trend + theoretical reference)
-    ax = axes[0]
-    ax.set_ylabel("Magnitude (dB)")
-    ax.plot(freqs, H_db, "r-", linewidth=1.2, alpha=0.8, label="Measured (raw)")
-    ax.plot(freqs, smoothed_db, "g--", linewidth=1.5, alpha=0.7, label="Smoothed trend")
-    ax.plot(freqs, expected_db, "k:", linewidth=1.2, alpha=0.6, label="Theoretical input")
-    ax.grid(True, which="major", axis="x", alpha=0.3)
-    y_min = min(H_db.min(), smoothed_db.min(), expected_db.min())
-    y_max = max(H_db.max(), smoothed_db.max(), expected_db.max())
-    y_range = y_max - y_min
-    ax.set_ylim(y_min - y_range * 0.05, y_max + y_range * 0.05)
-    ax.legend(loc="upper right", fontsize=9)
+    axes[1].plot(freqs, deviation)
+    axes[1].axhline(0.0, linestyle="--")
+    axes[1].set_ylabel("Deviation (dB)")
 
-    # Panel 2: Deviation from theoretical profile (shifted to match measurement)
-    ax = axes[1]
-    # Auto-detect: if values are large (>50) they're likely percent, not dB
-    max_abs_dev = max(abs(deviation_db.max()), abs(deviation_db.min()))
-    is_pct = max_abs_dev > 50 or float(np.mean(np.abs(deviation_db))) > 10
-
-    if is_pct:
-        ax.set_ylabel("Deviation from theory (%)")
-        pct_thresh = max(max_abs_dev * 0.1, 5.0)  # sensible threshold for percent
-    else:
-        ax.set_ylabel("Deviation from theory (dB)")
-        pct_thresh = max(max_abs_dev * 0.25, 1.0)
-
-    ax.plot(freqs, deviation_db, "b-", linewidth=1.0, alpha=0.7)
-    ax.axhline(0, color="red", linewidth=0.8, linestyle="--")
-    ax.axhline(pct_thresh, color="orange", linewidth=0.5, linestyle=":", alpha=0.5)
-    ax.axhline(-pct_thresh, color="orange", linewidth=0.5, linestyle=":", alpha=0.5)
-    ax.grid(True, which="major", axis="x", alpha=0.3)
-    y_max_d = max(abs(deviation_db.max()), abs(deviation_db.min()))
-    if y_max_d > 0:
-        ax.set_ylim(-y_max_d * 1.05, y_max_d * 1.05)
-
-    # Panel 3: Correction factor (inverted chain coloration)
-    ax = axes[2]
-    ax.set_ylabel("Correction factor")
-    ax.plot(freqs, corr_factors, "m-", linewidth=1.2, alpha=0.8)
-    ax.axhline(1.0, color="gray", linewidth=0.8, linestyle="--")
-    ax.grid(True, which="major", axis="x", alpha=0.3)
-    y_min_c = min(corr_factors.min(), 0.95)
-    y_max_c = max(corr_factors.max(), 1.05)
-    y_range_c = y_max_c - y_min_c
-    ax.set_ylim(y_min_c - y_range_c * 0.05, y_max_c + y_range_c * 0.05)
-
+    axes[2].plot(freqs, correction)
+    axes[2].axhline(1.0, linestyle="--")
+    axes[2].set_ylabel("Correction factor")
     axes[2].set_xlabel("Frequency (Hz)")
+
     for ax in axes:
         ax.set_xscale("log")
-        ax.set_xlim(max(freqs[0], 20), freqs[-1])
-
+        ax.grid(True, which="both", alpha=0.25)
+        ax.set_xlim(max(1.0, float(np.nanmin(freqs))), float(np.nanmax(freqs)))
     fig.tight_layout()
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return buf.read(), corr_factors, smoothed_db
+    buf = io.BytesIO(); fig.savefig(buf, format="png", bbox_inches="tight"); plt.close(fig)
+    return buf.getvalue(), correction, smooth
+
+
+def build_validate_chart_png(freqs, deviation_db, pct_dev, title="Validation Result"):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    freqs=np.asarray(freqs,float); deviation_db=np.asarray(deviation_db,float); pct_dev=np.asarray(pct_dev,float)
+    fig, axes=plt.subplots(1,2,figsize=(16,5),dpi=120)
+    fig.suptitle(title,fontsize=14,fontweight="bold")
+    axes[0].plot(freqs,deviation_db); axes[0].axhline(0,linestyle="--"); axes[0].set_ylabel("Deviation (dB)")
+    axes[1].plot(freqs,pct_dev); axes[1].set_ylabel("Absolute deviation (%)")
+    for ax in axes:
+        ax.set_xscale("log"); ax.set_xlabel("Frequency (Hz)"); ax.grid(True,which="both",alpha=.25)
+    fig.tight_layout(); buf=io.BytesIO(); fig.savefig(buf,format="png",bbox_inches="tight"); plt.close(fig)
+    return buf.getvalue()
+
+
+def build_noise_chart_png(freqs, H_db, smoothed_db, expected_db, deviation_db, corr_factors,
+                          num_neighbors=5, title="Noise Calibration Response"):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    freqs=np.asarray(freqs,float)
+    fig,axes=plt.subplots(3,1,figsize=(12,10),dpi=120,sharex=True)
+    fig.suptitle(title,fontsize=14,fontweight="bold")
+    axes[0].plot(freqs,H_db,label="Measured"); axes[0].plot(freqs,smoothed_db,label="Smoothed"); axes[0].plot(freqs,expected_db,linestyle=":",label="Expected")
+    axes[0].set_ylabel("Level (dB)"); axes[0].legend(fontsize=9)
+    axes[1].plot(freqs,deviation_db); axes[1].axhline(0,linestyle="--"); axes[1].set_ylabel("Deviation")
+    axes[2].plot(freqs,corr_factors); axes[2].axhline(1,linestyle="--"); axes[2].set_ylabel("Correction factor"); axes[2].set_xlabel("Frequency (Hz)")
+    for ax in axes: ax.set_xscale("log"); ax.grid(True,which="both",alpha=.25)
+    fig.tight_layout(); buf=io.BytesIO(); fig.savefig(buf,format="png",bbox_inches="tight"); plt.close(fig)
+    return buf.getvalue(), np.asarray(corr_factors,float), np.asarray(smoothed_db,float)
+
+
+def create_gui_response_figure(freq_min: float, freq_max: float):
+    """Create the GUI's two vertically stacked response axes.
+
+    Top: received level in dBFS.  Bottom: normalized frequency response where a
+    frequency-independent gain/attenuation appears as a flat 0 dB line.
+    """
+    from matplotlib.figure import Figure
+    fig = Figure(figsize=(7.2, 5.2), dpi=100)
+    ax_level = fig.add_subplot(211)
+    ax_response = fig.add_subplot(212, sharex=ax_level)
+    ax_level.set_ylabel("Received level (dBFS)")
+    ax_response.set_ylabel("Relative response (dB)")
+    ax_response.set_xlabel("Frequency (Hz)")
+    for ax in (ax_level, ax_response):
+        ax.set_xscale("log")
+        ax.set_xlim(freq_min, freq_max)
+        ax.grid(True, which="both", alpha=0.25)
+    level_line, = ax_level.plot([], [], label="Received")
+    level_smooth, = ax_level.plot([], [], linestyle="--", label="Smoothed")
+    response_line, = ax_response.plot([], [], label="Relative response")
+    ax_response.axhline(0.0, linestyle=":")
+    ax_level.legend(loc="upper right", fontsize=8)
+    ax_response.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    return fig, ax_level, ax_response, level_line, level_smooth, response_line
+
+
+def update_gui_response_figure(
+            ax_level,
+            ax_response,
+            level_line,
+            level_smooth_line,
+            response_line,
+            freqs,
+            received_dbfs,
+            smoothed_dbfs,
+            relative_response_db,
+            freq_min,
+            freq_max,
+        ):
+    """Update GUI response artists and axes from one analysis payload."""
+    freqs = np.asarray(freqs, dtype=float)
+    level = np.asarray(received_dbfs, dtype=float)
+    smooth = np.asarray(smoothed_dbfs, dtype=float)
+    response = np.asarray(relative_response_db, dtype=float)
+
+    valid_level = np.isfinite(freqs) & np.isfinite(level)
+    level_line.set_data(freqs[valid_level], level[valid_level])
+    valid_smooth = np.isfinite(freqs) & np.isfinite(smooth)
+    level_smooth_line.set_data(freqs[valid_smooth], smooth[valid_smooth])
+    valid_response = np.isfinite(freqs) & np.isfinite(response)
+    response_line.set_data(freqs[valid_response], response[valid_response])
+
+    ax_level.set_xlim(float(freq_min), float(freq_max))
+    if np.any(valid_level):
+        lo = float(np.min(level[valid_level]))
+        hi = float(np.max(level[valid_level]))
+        margin = max((hi - lo) * 0.12, 2.0)
+        ax_level.set_ylim(lo - margin, hi + margin)
+    if np.any(valid_response):
+        mag = max(float(np.max(np.abs(response[valid_response]))) * 1.2, 1.0)
+        ax_response.set_ylim(-mag, mag)
