@@ -16,30 +16,22 @@ import time
 from pathlib import Path
 
 import numpy as np
-import sounddevice as sd
+try:
+    import sounddevice as sd
+except ImportError:
+    print("Warning: unable to import sounddevice")
+    sd = None
 
 # Resolve repo root (one level up from this script's directory)
 REPO_ROOT = Path(__file__).resolve().parent
 
-# Load config values — all constants flow through here
-config_path = REPO_ROOT / "config" / "config.py"
-_config_defaults = {}
-try:
-    for line in config_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" in line:
-            key, val = line.split("=", 1)
-            _config_defaults[key.strip()] = eval(val.strip())
-except FileNotFoundError:
-    pass
+from config import config as cfg
 
-TONE_FREQ = _config_defaults.get("tone_freq", 440)
-TONE_DURATION = _config_defaults.get("device_test_tone_duration", 3.0)
-RECORD_SECONDS = _config_defaults.get("record_seconds", 3.0)
-TEST_TONE_VOL = _config_defaults.get("test_tone_vol", 0.3)
-SEND_GAIN = _config_defaults.get("send_gain", 50)
+TONE_FREQ = cfg.device_test_tone_freq
+TONE_DURATION = cfg.device_test_tone_duration
+RECORD_SECONDS = cfg.device_test_tone_record_secs
+TEST_TONE_VOL = cfg.tone_amplitude
+SEND_GAIN = cfg.send_gain
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +40,7 @@ SEND_GAIN = _config_defaults.get("send_gain", 50)
 def generate_tone(freq=TONE_FREQ, duration=TONE_DURATION, fs=None, send_gain=SEND_GAIN, vol=TEST_TONE_VOL):
     """Generate a sine wave test tone."""
     if fs is None:
-        fs = _config_defaults.get("fs", 44100)
+        fs = cfg.fs
     t = np.arange(int(fs * duration)) / fs
     amplitude = vol * (send_gain / 100.0)
     return (amplitude * np.sin(2 * np.pi * freq * t)).astype(np.float32)
@@ -178,7 +170,7 @@ def play_tone(device_idx):
         return False
 
     tone = generate_tone()
-    sr = _config_defaults.get("fs", 44100)
+    sr = cfg.fs
     try:
         sd.play(tone, samplerate=sr, device=device_idx)
         sd.wait()  # block until playback completes
@@ -202,7 +194,7 @@ def record_from_device(device_idx):
     # Use the device's default sample rate if available, fall back to config fs
     sr = dev.get("default_samplerate", None)
     if sr is None or sr <= 0:
-        sr = _config_defaults.get("fs", 44100)
+        sr = cfg.fs
     frames = int(sr * RECORD_SECONDS)
 
     buf = np.empty(frames, dtype='float32')
@@ -291,91 +283,6 @@ def interactive_test(output_indices, input_indices):
 
 
 # ---------------------------------------------------------------------------
-# Config saving
-# ---------------------------------------------------------------------------
-def load_config():
-    """Load existing config values, returning defaults if file missing."""
-    config_path = REPO_ROOT / "config" / "config.py"
-    defaults = {}
-    try:
-        for line in config_path.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" in line:
-                key, val = line.split("=", 1)
-                key = key.strip()
-                val = val.strip()
-                # Try to parse Python literals safely
-                try:
-                    parsed = eval(val)
-                    defaults[key] = parsed
-                except Exception:
-                    defaults[key] = val
-    except FileNotFoundError:
-        pass
-    return defaults
-
-
-def save_config(send_idx, recv_idx):
-    """Write device selections to config/config.py, preserving other keys."""
-    config_path = REPO_ROOT / "config" / "config.py"
-    existing = load_config()
-
-    # Build the full config text
-    lines = []
-
-    # Header comment
-    lines.append("# PyAmpScope configuration - do not remove this marker")
-    lines.append("# Audio interface selection (user fills these in after running list_audio_devices.py)")
-
-    # Only write send_device if we have a valid selection
-    if send_idx is not None:
-        existing["send_device"] = send_idx
-    if recv_idx is not None:
-        existing["recv_device"] = recv_idx
-
-    config_keys_order = [
-        "send_device", "recv_device",
-        "send_ch", "recv_ch",
-        "send_gain", "recv_gain",
-        "cal_method", "freq_min", "freq_max", "fs",
-        "recv_path",
-        "data_dir", "logs_dir",
-        "cal_send_file", "cal_recv_file",
-    ]
-
-    for key in config_keys_order:
-        if key in existing:
-            val = existing[key]
-            lines.append(f"{key} = {val}")
-
-    # Any user-defined keys not in our known list
-    for key, val in existing.items():
-        if key not in config_keys_order:
-            lines.append(f"\n# User-defined\n{key} = {val}")
-
-    config_path.write_text("\n".join(lines) + "\n")
-
-    # Resolve device names for confirmation message
-    try:
-        all_devs = sd.query_devices()
-        if isinstance(all_devs, dict):
-            all_devs = [all_devs]
-        send_name = format_name(all_devs[send_idx]["name"]) if send_idx is not None and 0 <= send_idx < len(all_devs) else "default"
-        recv_name = format_name(all_devs[recv_idx]["name"]) if recv_idx is not None and 0 <= recv_idx < len(all_devs) else "default"
-    except Exception:
-        send_name = str(send_idx) if send_idx is not None else "default"
-        recv_name = str(recv_idx) if recv_idx is not None else "default"
-
-    print(f"\nConfig saved to config/config.py:")
-    if send_idx is not None:
-        print(f"  send_device = {send_idx}   ({send_name})")
-    if recv_idx is not None:
-        print(f"  recv_device = {recv_idx}   ({recv_name})")
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -437,61 +344,12 @@ def main():
             print(f"Error: device {recv_idx} does not support capture.", file=sys.stderr)
             sys.exit(1)
 
-        #save_config(send_idx, recv_idx)
         sys.exit(0)
 
     # Interactive mode - continue to device selection
 
     print("Testing devices (type 'q' when done):")
     interactive_test(output_indices, input_indices)
-
-    """# Prompt device selection
-    print()
-    send_idx = None
-    recv_idx = None
-
-    while True:
-        try:
-            send_input = input(f"Select send device (output/both index [{', '.join(map(str, output_indices))}]): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-
-        if not send_input:
-            break
-        try:
-            send_idx = int(send_input)
-            if send_idx not in set(output_indices):
-                print(f"  Please choose from: {output_indices}")
-                continue
-            break
-        except ValueError:
-            print("  Enter a numeric index or press Enter to skip")
-
-    while True:
-        try:
-            recv_input = input(f"Select receive device (input/both index [{', '.join(map(str, input_indices))}]): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-
-        if not recv_input:
-            break
-        try:
-            recv_idx = int(recv_input)
-            if recv_idx not in set(input_indices):
-                print(f"  Please choose from: {input_indices}")
-                continue
-            break
-        except ValueError:
-            print("  Enter a numeric index or press Enter to skip")
-
-    # Ensure both were entered before saving
-    if send_idx is None or recv_idx is None:
-        print("Both send and receive devices must be selected.")
-        return
-
-    #save_config(send_idx, recv_idx)"""
 
 
 if __name__ == "__main__":
