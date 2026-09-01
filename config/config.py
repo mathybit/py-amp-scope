@@ -34,7 +34,7 @@ log_base = 2
 log_f = lambda x: np.log(x) / np.log(log_base)
 
 noise_calibration_time = 30
-num_freqs_default = 30
+num_freqs_default = 300
 tone_amplitude = 0.5       # sine PEAK before Send Gain
 tone_duration = 0.7
 tone_gap = 0.2
