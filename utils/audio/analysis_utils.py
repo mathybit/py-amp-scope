@@ -172,16 +172,16 @@ def _aggregate_sweep_bands(per_tone: list[dict], bands: dict[str, tuple[float, f
 
 
 def analyze_sweep_measurement(
-    capture: np.ndarray,
-    stimulus_metadata: dict,
-    fs: int,
-    *,
-    recv_correction_freqs: Optional[np.ndarray] = None,
-    recv_correction_factors: Optional[np.ndarray] = None,
-    frequency_bands: Optional[dict[str, tuple[float, float]]] = None,
-    max_harmonic: int = 10,
-    trim_fraction: float = 0.15,
-) -> dict:
+            capture: np.ndarray,
+            stimulus_metadata: dict,
+            fs: int,
+            *,
+            recv_correction_freqs: Optional[np.ndarray] = None,
+            recv_correction_factors: Optional[np.ndarray] = None,
+            frequency_bands: Optional[dict[str, tuple[float, float]]] = None,
+            max_harmonic: int = 10,
+            trim_fraction: float = 0.15,
+        ) -> dict:
     """Analyze one captured sweep and return per-tone + aggregate metrics."""
     bands = frequency_bands or cfg.frequency_bands
     freqs = np.asarray(stimulus_metadata["frequencies"], dtype=np.float64)
@@ -439,15 +439,15 @@ def integrate_psd_band(freqs: np.ndarray, psd: np.ndarray, lo: float, hi: float)
 
 
 def analyze_noise_measurement(
-    capture: np.ndarray,
-    reference_signal: np.ndarray,
-    fs: int,
-    target_freqs: np.ndarray,
-    *,
-    recv_correction_freqs: Optional[np.ndarray] = None,
-    recv_correction_factors: Optional[np.ndarray] = None,
-    frequency_bands: Optional[dict[str, tuple[float, float]]] = None,
-) -> dict:
+            capture: np.ndarray,
+            reference_signal: np.ndarray,
+            fs: int,
+            target_freqs: np.ndarray,
+            *,
+            recv_correction_freqs: Optional[np.ndarray] = None,
+            recv_correction_factors: Optional[np.ndarray] = None,
+            frequency_bands: Optional[dict[str, tuple[float, float]]] = None,
+        ) -> dict:
     """Analyze broadband noise with Welch PSD and normalized transfer response."""
     bands = frequency_bands or cfg.frequency_bands
     cap = np.asarray(capture, dtype=np.float64)
