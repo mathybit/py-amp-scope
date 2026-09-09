@@ -118,12 +118,12 @@ class AmpAnalyzerApp:
 
         ttk.Label(left, text="Tone Amplitude (peak FS):").pack(anchor="w")
         self.var_tone_amplitude = tk.DoubleVar(value=float(cfg.tone_amplitude))
-        ttk.Spinbox(left, from_=0.001, to=1.0, increment=0.01,
+        ttk.Spinbox(left, from_=0.001, to=1.0, increment=0.1,
                     textvariable=self.var_tone_amplitude).pack(fill=tk.X, pady=(1,3))
 
         ttk.Label(left, text="Tone Duration (s):").pack(anchor="w")
         self.var_tone_duration = tk.DoubleVar(value=float(cfg.tone_duration))
-        ttk.Spinbox(left, from_=0.05, to=5.0, increment=0.05,
+        ttk.Spinbox(left, from_=0.05, to=5.0, increment=0.1,
                     textvariable=self.var_tone_duration).pack(fill=tk.X, pady=(1,3))
 
         ttk.Label(left, text="Tone Gap (s):").pack(anchor="w")

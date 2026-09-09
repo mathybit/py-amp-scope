@@ -35,8 +35,8 @@ log_f = lambda x: np.log(x) / np.log(log_base)
 
 noise_calibration_time = 30
 num_freqs_default = 300
-tone_amplitude = 0.5       # sine PEAK before Send Gain
-tone_duration = 0.7
+tone_amplitude = 0.3       # sine PEAK before Send Gain
+tone_duration = 1.0
 tone_gap = 0.2
 noise_peak_headroom = 0.95 # globally scale generated broadband noise below this peak
 sweep_peak_headroom = 0.95 # same protection after per-frequency send correction
