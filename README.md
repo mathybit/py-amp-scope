@@ -32,27 +32,25 @@ This installs the core utility packages necessary to run the project.
 ## Quick Start
 
 1. Edit `config/config.py` to set your audio interface device indices, gain levels, and sample rate. You may use the `list_audio_devices.py` script to verify your send / receive devices (you may need to input some sort of signal to the receive device).
+
 2. Run a send calibration first (using a send calibration is optional, but the file must exist before receive calibration can use it):
 
 ```bash
 python calibrate_send.py
 ```
 
-3. Run the receive calibration for your chosen path:
+3. Run the receive calibration:
 
 ```bash
-python calibrate_recv.py --path dir     # Direct path
-python calibrate_recv.py --path iso     # Isolated (transformer) path
+python calibrate_recv.py
 ```
 
 4. Validate both paths to check flatness after correction:
 
 ```bash
 python validate_send_calibration.py --correct-send
-python validate_recv_calibration.py --path dir --correct-recv
-python validate_recv_calibration.py --path iso --correct-recv
+python validate_recv_calibration.py --correct-recv
 ```
-
 
 5. Run PyAmpScope
 
@@ -79,16 +77,15 @@ Examples:
 
 ```bash
 python calibrate_send.py
-python calibrate_recv.py --path iso
-python calibrate_recv.py --path iso --correct-send  # Applies send correction during receive calibration
+python calibrate_recv.py --correct-send  # Applies send correction during receive calibration
 ```
 
 There are additional validation scripts provided to check the measurement equipment response curve after calibration. These allow you to check the response curves after correction is applied. By default, the scripts do not apply any correction.
 
 ```bash
 python validate_send_calibration.py --correct-send
-python validate_recv_calibration.py --path dir --correct-recv
-python validate_recv_calibration.py --path iso --correct-send --correct-recv
+python validate_recv_calibration.py --correct-recv
+python validate_recv_calibration.py --correct-send --correct-recv
 ```
 
 
@@ -98,8 +95,7 @@ python validate_recv_calibration.py --path iso --correct-send --correct-recv
 Calibration files are produced in a specific dependency chain. Follow this order:
 
 1. `calibrate_send.py` — generates `data/cal_send_corrections.npz`
-2. `calibrate_recv.py --path dir` — generates `data/cal_recv_dir_base_corrections.npz`
-3. `calibrate_recv.py --path iso` — generates `data/cal_recv_iso_base_corrections.npz`
+2. `calibrate_recv.py — generates `data/cal_recv_dir_base_corrections.npz`
 4. Validation scripts (see below)
 
 The validation scripts load correction profiles from the files produced above; if a profile does not exist, the script will error.
@@ -133,7 +129,7 @@ Validation output filenames use compound labels based on which corrections are a
 |---|---|---|---|
 | send validation | `sb` | Send baseline (no correction) | `validate_send_sb_chart.png` |
 | send validation | `corr` | Send with correction applied | `validate_send_corr_chart.png` |
-| receive validation | `sbrb`, `sbrc`, `scrb`, `scrc` | Baseline/corrected prefix for each path, combined per-path (e.g., `dir` or `iso`) | `validate_recv_dir_sbrc_chart.png` |
+| receive validation | `sbrb`, `sbrc`, `scrb`, `scrc` | Baseline/corrected prefix for both send (s) and receive (r) | `validate_recv_dir_sbrc_chart.png` |
 
 
 
@@ -162,8 +158,6 @@ PyAmpScope uses one set of level definitions in the GUI, calibration scripts, an
 
 
 ## Analysis
-
-### Sweep test
 
 One generated waveform contains the complete log-spaced sweep, with silence between tones. The same capture engine is used by the GUI, calibration, and validation programs.
 
@@ -194,15 +188,14 @@ The canonical band definitions live in `config/config.py`:
 
 
 
-## Corrections
+## Using Corrections
 
 Corrections are always **optional and off by default**. To use this feature, you must run the calibration scripts first, which generates the necessary correction files.
 
 ### Receive correction
 
 - Receive correction is applied after capture. Sweep harmonic components are corrected at their own harmonic frequencies, not only at the fundamental.
-- Direct and isolated receive profiles are loaded independently according to the selected path.
-- While optional, my experiments show that using receive correction is beneficial.
+- While optional, my experiments show that using **receive correction is beneficial**.
 
 ### Send correction
 
