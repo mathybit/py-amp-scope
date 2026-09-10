@@ -35,5 +35,4 @@ ipykernel>=7.0
 iprogress
 
 # Testing
-pytest>=7.4
-pytest-cov>=4.1
+pytest>=9.1
