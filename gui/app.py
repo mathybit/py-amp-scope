@@ -133,10 +133,20 @@ class AmpAnalyzerApp:
 
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
         ttk.Label(left, text="SEND LEVEL", style="Header.TLabel").pack(anchor="w")
-        ttk.Label(left, text="Send Gain (%):").pack(anchor="w")
-        self.var_send_gain = tk.DoubleVar(value=int(cfg.send_gain))
-        ttk.Spinbox(left, from_=0, to=100, increment=1,
-                    textvariable=self.var_send_gain).pack(fill=tk.X, pady=(1,3))
+        #self.label_send_gain = ttk.Label(left, text="Send Gain (%):").pack(anchor="w")
+        self.label_send_gain = ttk.Label(left, text="Send Gain (%)")
+        self.label_send_gain.pack(anchor="w")
+        self.var_send_gain = tk.IntVar(value=int(cfg.send_gain))
+        def _update_gain_label(*args):
+            gain = self.var_send_gain.get()
+            label = self.label_send_gain
+            label.config(text=f"Send Gain ({gain}%)")
+        self.var_send_gain.trace_add("write", _update_gain_label)
+        #ttk.Spinbox(left, from_=1, to=100, increment=1,
+        #            textvariable=self.var_send_gain).pack(fill=tk.X, pady=(1,3))
+        ttk.Scale(left, from_=1, to=100, orient=tk.HORIZONTAL,
+                  variable=self.var_send_gain).pack(fill=tk.X, pady=(1, 3))
+        _update_gain_label()
 
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
         ttk.Label(left, text="CORRECTIONS", style="Header.TLabel").pack(anchor="w")
